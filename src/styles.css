@@ -1,0 +1,139 @@
+@import "tailwindcss";
+@import "leaflet/dist/leaflet.css";
+
+@custom-variant squat (@media (orientation: landscape) and (max-height: 540px));
+
+@theme {
+  --color-bg: #f4f1ea;
+  --color-surface: #fffcf7;
+  --color-surface-2: #ebe6db;
+  --color-fg: #1a1814;
+  --color-muted: #6b6660;
+  --color-subtle: #8a847a;
+  --color-primary: #2f4a63;
+  --color-primary-fg: #f4f1ea;
+  --color-border: #ddd6c8;
+  --color-danger: #8f2d22;
+  --color-ok: #2f5d45;
+
+  --font-sans: "Source Sans 3", "Segoe UI", system-ui, sans-serif;
+  --font-display: "Newsreader", "Iowan Old Style", "Palatino Linotype", serif;
+
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 20px;
+  --radius-xl: 28px;
+
+  --shadow-border:
+    0px 0px 0px 1px rgba(26, 24, 20, 0.06),
+    0px 1px 2px -1px rgba(26, 24, 20, 0.06),
+    0px 2px 4px 0px rgba(26, 24, 20, 0.04);
+  --shadow-border-hover:
+    0px 0px 0px 1px rgba(26, 24, 20, 0.08),
+    0px 1px 2px -1px rgba(26, 24, 20, 0.08),
+    0px 2px 4px 0px rgba(26, 24, 20, 0.06);
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    background: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    line-height: 1.5;
+  }
+
+  h1, h2, h3 {
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+}
+
+.font-display {
+  font-family: var(--font-display);
+  font-optical-sizing: auto;
+}
+
+.leaflet-container {
+  background: var(--color-surface-2);
+  font-family: var(--font-sans);
+  color: var(--color-fg);
+  width: 100% !important;
+  height: 100% !important;
+  max-width: 100%;
+  max-height: 100%;
+}
+
+.nc-map-shell {
+  overflow: hidden;
+  isolation: isolate;
+  contain: paint;
+  clip-path: inset(0);
+}
+
+.leaflet-control-attribution {
+  font-size: 10px;
+  background: color-mix(in oklab, var(--color-surface) 88%, transparent);
+}
+
+.nc-marker-wrap {
+  background: transparent;
+  border: none;
+}
+
+.nc-marker {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  box-shadow: var(--shadow-border);
+}
+
+.nc-marker-start {
+  background: var(--color-primary);
+  color: var(--color-primary-fg);
+}
+
+.nc-marker-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--color-primary-fg);
+}
+
+.nc-marker-stop {
+  background: var(--color-surface);
+  color: var(--color-fg);
+  border: 1px solid color-mix(in oklab, var(--color-fg) 16%, transparent);
+}
+
+.nc-route-line {
+  stroke: var(--color-primary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
