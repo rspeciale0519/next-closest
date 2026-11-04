@@ -1,8 +1,8 @@
 import type { Place } from "./geo.ts";
 import { normalizeGeocodeKey } from "./geo.ts";
 import {
+  cacheTtlSeconds,
   createMemoryGeocodeCache,
-  GEOCODE_CACHE_TTL_SECONDS,
   type GeocodeCache,
 } from "./geocode-cache.ts";
 import { getRedis } from "./upstash-redis.server.ts";
@@ -32,7 +32,7 @@ export function getGeocodeCache(): GeocodeCache {
       await memory.set(query, place);
       try {
         await redis.set(PREFIX + normalizeGeocodeKey(query), { v: 1, place } satisfies CacheRecord, {
-          ex: GEOCODE_CACHE_TTL_SECONDS,
+          ex: cacheTtlSeconds(place),
         });
       } catch {
         // keep the in-memory write

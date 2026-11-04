@@ -31,6 +31,17 @@ export type FetchJsonOptions = {
   signal?: AbortSignal;
 };
 
+export function listProviderFetchOpts(
+  fetchOpts?: { timeoutMs?: number; attempts?: number },
+  signal?: AbortSignal,
+): FetchJsonOptions {
+  return {
+    timeoutMs: fetchOpts?.timeoutMs ?? 12000,
+    attempts: fetchOpts?.attempts,
+    signal,
+  };
+}
+
 export async function fetchJson<T>(
   url: string,
   init?: RequestInit,

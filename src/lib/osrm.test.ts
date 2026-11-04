@@ -127,6 +127,26 @@ describe("OSRM cache", () => {
     assert.equal(second, table);
     assert.equal(osrmCacheKey(points), osrmCacheKey(shifted));
   });
+
+  it("evicts the oldest in-memory table when the cache is full", async () => {
+    const cache = createMemoryOsrmCache(60_000, new Map(), 1);
+    const table = {
+      distances: [
+        [0, 1],
+        [1, 0],
+      ],
+      durations: [
+        [0, 1],
+        [1, 0],
+      ],
+    };
+    const first = [start, stop("A", 0, 1)];
+    const second = [start, stop("B", 0, 2)];
+    await cache.set(first, table);
+    await cache.set(second, table);
+    assert.equal(await cache.get(first), undefined);
+    assert.deepEqual(await cache.get(second), table);
+  });
 });
 
 describe("OSRM global cap", () => {

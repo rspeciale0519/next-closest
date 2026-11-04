@@ -15,8 +15,12 @@ import {
   waitForOsrmSlot,
   RATE_LIMIT_REQUESTS_PER_MINUTE,
   RateLimitError,
+  UPSTASH_LIMIT_TIMEOUT_MS,
+  consumeUpstashResult,
   limitFailClosedFromEnv,
   resolveLimiter,
+  throwSharedSlotFailure,
+  waitForSharedSlot,
   type RateLimiter,
 } from "./rate-limit.ts";
 import { getRedis } from "./upstash-redis.server.ts";
@@ -50,21 +54,18 @@ function upstashLimiter(
 ): RateLimiter | null {
   const redis = getRedis();
   if (!redis) return null;
+  const failClosed = limitFailClosed();
   const rl = new Ratelimit({
     redis,
     limiter: Ratelimit.slidingWindow(limit, window),
     prefix,
     analytics: false,
-    timeout: 1500,
+    timeout: UPSTASH_LIMIT_TIMEOUT_MS,
   });
   return {
     async consume(bucket: string, cost = 1) {
       const result = await rl.limit(bucket, { rate: Math.max(1, Math.floor(cost)) });
-      if (result.success) return { ok: true };
-      return {
-        ok: false,
-        retryAfterSec: Math.max(1, Math.ceil((result.reset - Date.now()) / 1000)),
-      };
+      return consumeUpstashResult(result, failClosed);
     },
   };
 }
@@ -156,13 +157,11 @@ export async function tryConsumeOsrmSlot(signal?: AbortSignal): Promise<boolean>
   });
 }
 
-/** Shared Census/ArcGIS slot. Cache hits must not call this. */
+/** Shared Census/ArcGIS slot. Cache hits must not call this. Busy → 429; Redis down → 503. */
 export async function consumeSharedGeocodeSlot(signal?: AbortSignal): Promise<void> {
-  const got = await waitForOsrmSlot(() => getPlanLimiters().geocodeUpstream.consume("global", 1), {
+  const outcome = await waitForSharedSlot(() => getPlanLimiters().geocodeUpstream.consume("global", 1), {
     maxWaitMs: GEOCODE_SLOT_WAIT_MS,
     signal,
   });
-  if (got) return;
-  if (limitFailClosed()) throw new LimitServiceUnavailableError();
-  throw new RateLimitError("Too many address lookups right now. Try again shortly.", 2);
+  throwSharedSlotFailure(outcome, 2);
 }
