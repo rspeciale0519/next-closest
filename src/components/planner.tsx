@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import { PlanProgressBar } from "@/components/plan-progress-bar";
 import { RouteMap } from "@/components/route-map";
 import { SpreadsheetImport } from "@/components/spreadsheet-import";
 import { Button } from "@/components/ui/button";
@@ -17,7 +18,6 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
   geocodeStops,
-  planRoute,
   refineRoadOrder,
   resolveStartPlace,
   reverseGeocode,
@@ -51,6 +51,7 @@ export function Planner() {
   const [stopsText, setStopsText] = useState("");
   const [planning, setPlanning] = useState(false);
   const [progress, setProgress] = useState<PlanProgress | null>(null);
+  const [previewProgress, setPreviewProgress] = useState<PlanProgress | null>(null);
   const [plan, setPlan] = useState<PlanResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
@@ -61,6 +62,7 @@ export function Planner() {
 
   const stopCount = parseAddressList(stopsText).length;
   const overLimit = stopCount > MAX_PLAN_STOPS;
+  const barProgress = progress ?? previewProgress;
   const canPlan =
     startQuery.trim().length > 0 && stopCount > 0 && !overLimit && !planning && !readingImage;
 
@@ -71,6 +73,14 @@ export function Planner() {
       setStopsText(stored.stopsText);
     }
     setHydrated(true);
+    const raw = new URLSearchParams(window.location.search).get("progressPreview");
+    if (!raw) return;
+    const [doneRaw, totalRaw, phaseRaw] = raw.split("/");
+    const done = Number(doneRaw);
+    const total = Number(totalRaw);
+    if (!Number.isFinite(done) || !Number.isFinite(total) || total <= 0) return;
+    const phase = phaseRaw === "order" || phaseRaw === "road" ? phaseRaw : "geocode";
+    setPreviewProgress({ phase, done, total });
   }, []);
 
   useEffect(() => {
@@ -254,7 +264,7 @@ export function Planner() {
       return;
     }
     setPlanning(true);
-    setProgress(null);
+    setProgress({ phase: "geocode", done: 0, total: stops.length });
     setError(null);
     const start = {
       query: startQuery.trim(),
@@ -262,22 +272,24 @@ export function Planner() {
       label: startPlace?.label,
     };
     try {
-      const result =
-        stops.length <= 25
-          ? await planRoute({ data: { start, stops } })
-          : await runPlan(
-              { start, stops },
-              {
-                resolveStart: (value) => resolveStartPlace({ data: value }),
-                geocodeBatch: (data) => geocodeStops({ data }),
-                refineRoad: (origin, located) =>
-                  refineRoadOrder({ data: { start: origin, stops: located } }),
-              },
-              {
-                onProgress: setProgress,
-                yieldFn: () => new Promise((resolve) => window.setTimeout(resolve, 0)),
-              },
-            );
+      const result = await runPlan(
+        { start, stops },
+        {
+          resolveStart: (value) => resolveStartPlace({ data: value }),
+          geocodeBatch: (data) => geocodeStops({ data }),
+          refineRoad: (origin, located) =>
+            refineRoadOrder({ data: { start: origin, stops: located } }),
+        },
+        {
+          onProgress: (next) => {
+            setProgress((prev) => {
+              if (!prev) return next;
+              return next.done < prev.done ? { ...next, done: prev.done } : next;
+            });
+          },
+          yieldFn: () => new Promise((resolve) => window.setTimeout(resolve, 0)),
+        },
+      );
       setPlan(result);
       if (result.ordered.length === 0) {
         setError("None of those addresses could be found. Check spelling and try again.");
@@ -470,6 +482,10 @@ export function Planner() {
             <p className="rounded-lg bg-danger/10 px-3 py-2 text-sm text-danger" role="alert">
               {overLimit ? tooManyStopsMessage() : error}
             </p>
+          ) : null}
+
+          {barProgress ? (
+            <PlanProgressBar progress={barProgress} className="rounded-xl bg-surface p-4 shadow-border" />
           ) : null}
 
           <Button size="lg" className="w-full" disabled={!canPlan} onClick={() => void onPlan()}>

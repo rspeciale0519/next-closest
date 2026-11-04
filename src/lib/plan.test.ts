@@ -5,10 +5,12 @@ import {
   formatPlanProgress,
   GEOCODE_BATCH_SIZE,
   MAX_PLAN_STOPS,
+  planProgressView,
   runPlan,
   tooManyStopsMessage,
   type PlanDeps,
 } from "./plan.ts";
+import type { PlanProgress } from "./plan-types.ts";
 import type { Place } from "./geo.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { detectColumns, extractAddresses } from "./spreadsheet.ts";
@@ -43,6 +45,22 @@ describe("plan limits and progress copy", () => {
       formatPlanProgress({ phase: "geocode", done: 400, total: 1312 }),
       "Locating addresses 400 of 1,312",
     );
+  });
+
+  it("shows count text and a partial fill that sorting does not snap to full", () => {
+    const locating = planProgressView({ phase: "geocode", done: 400, total: 1312 });
+    assert.equal(locating.label, "400 of 1,312 addresses");
+    assert.equal(locating.now, 400);
+    assert.equal(locating.max, 1312);
+    assert.ok(Math.abs(locating.percent - (400 / 1312) * 100) < 1e-6);
+
+    const sortingPartial = planProgressView({ phase: "order", done: 400, total: 1312 });
+    assert.equal(sortingPartial.label, "Sorting 1,312 stops");
+    assert.equal(sortingPartial.percent, locating.percent);
+
+    const sortingDone = planProgressView({ phase: "order", done: 1312, total: 1312 });
+    assert.equal(sortingDone.percent, 100);
+    assert.equal(formatPlanProgress({ phase: "order", done: 1312, total: 1312 }), "Sorting 1,312 stops");
   });
 });
 
@@ -169,6 +187,34 @@ describe("runPlan", () => {
       result.ordered.map((s) => s.place.query),
       ["b", "a"],
     );
+  });
+
+  it("emits monotonic locate progress and keeps that fill into the sorting phase", async () => {
+    const stops = Array.from({ length: 40 }, (_, i) => `Stop ${i}`);
+    const events: PlanProgress[] = [];
+    await runPlan(
+      { start: { query: startPlace.query }, stops },
+      {
+        resolveStart: async () => startPlace,
+        geocodeBatch: async ({ queries }) =>
+          queries.map((query, i) => ({
+            query,
+            place: query === "Stop 3" ? null : placeFor(query, i),
+          })),
+      },
+      { onProgress: (event) => events.push({ ...event }) },
+    );
+    assert.ok(events.length >= 3);
+    for (let i = 1; i < events.length; i += 1) {
+      assert.ok(events[i].done >= events[i - 1].done, `progress moved backward at ${i}`);
+    }
+    const lastLocate = [...events].reverse().find((event) => event.phase === "geocode");
+    const sorting = events.find((event) => event.phase === "order");
+    assert.ok(lastLocate);
+    assert.ok(sorting);
+    assert.equal(lastLocate.done, 40);
+    assert.equal(sorting.done, 40);
+    assert.equal(planProgressView(sorting).percent, planProgressView(lastLocate).percent);
   });
 
   it("rejects more than 2,500 stops before any geocoding", async () => {

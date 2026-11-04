@@ -44,7 +44,33 @@ export function formatPlanProgress(progress: PlanProgress): string {
   }
   if (progress.phase === "start") return "Finding start address";
   if (progress.phase === "road") return "Calculating road distances";
-  return "Ordering stops";
+  return `Sorting ${progress.total.toLocaleString()} stops`;
+}
+
+export type PlanProgressView = {
+  now: number;
+  max: number;
+  percent: number;
+  label: string;
+};
+
+/** Count + bar fill. Locate uses processed/total; sort/road keep that fill (no snap). */
+export function planProgressView(progress: PlanProgress): PlanProgressView {
+  const max = Math.max(0, progress.total);
+  const now = Math.min(Math.max(0, progress.done), max);
+  const percent = max === 0 ? 0 : (now / max) * 100;
+  if (progress.phase === "order") {
+    return { now, max, percent, label: `Sorting ${max.toLocaleString()} stops` };
+  }
+  if (progress.phase === "road") {
+    return { now, max, percent, label: "Calculating road distances" };
+  }
+  return {
+    now,
+    max,
+    percent,
+    label: `${now.toLocaleString()} of ${max.toLocaleString()} addresses`,
+  };
 }
 
 export function assembleStraightPlan(start: Place, ordered: Place[]): PlanResult {
@@ -97,7 +123,7 @@ export async function runPlan(
   const cache = options.cache ?? new Map<string, Place | null>();
   const yieldFn = options.yieldFn ?? (async () => undefined);
 
-  notify({ phase: "start", done: 0, total: stops.length });
+  notify({ phase: "geocode", done: 0, total: stops.length });
   const start = await deps.resolveStart(input.start);
   const region = regionHintFromPlace(start);
   const bias = { lat: start.lat, lng: start.lng };
@@ -158,7 +184,8 @@ export async function runPlan(
   }
 
   if (located.length <= ROAD_REFINE_MAX_STOPS && deps.refineRoad) {
-    notify({ phase: "road", done: located.length, total: stops.length });
+    notify({ phase: "road", done, total: stops.length });
+    await yieldFn();
     try {
       const refined = await deps.refineRoad(start, located);
       return { ...refined, failures: [...refined.failures, ...failures] };
@@ -167,6 +194,7 @@ export async function runPlan(
     }
   }
 
-  notify({ phase: "order", done: located.length, total: stops.length });
+  notify({ phase: "order", done, total: stops.length });
+  await yieldFn();
   return { ...assembleStraightPlan(start, orderNearestByHaversine(start, located)), failures };
 }
