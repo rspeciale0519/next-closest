@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { fetchJson, GEOCODE_USER_AGENT, listProviderFetchOpts, LookupTimeoutError } from "./geo-http.ts";
+import { fetchJson, GEOCODE_USER_AGENT, listProviderFetchOpts, LookupTimeoutError, sleep } from "./geo-http.ts";
 import { LIST_GEOCODE_ATTEMPTS, LIST_GEOCODE_TIMEOUT_MS, PLAN_FN_MAX_DURATION_SECONDS } from "./plan-limits.ts";
 
 describe("list geocode budget", () => {
@@ -62,5 +62,17 @@ describe("list geocode budget", () => {
     } finally {
       globalThis.fetch = original;
     }
+  });
+
+  it("rejects sleep when the abort signal fires during the wait", async () => {
+    const ctrl = new AbortController();
+    const started = Date.now();
+    const pending = sleep(5000, ctrl.signal);
+    setTimeout(() => ctrl.abort(), 10);
+    await assert.rejects(
+      () => pending,
+      (err: unknown) => err instanceof DOMException && err.name === "AbortError",
+    );
+    assert.ok(Date.now() - started < 1000);
   });
 });

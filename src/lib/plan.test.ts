@@ -15,7 +15,7 @@ import {
   tooManyStopsMessage,
   type PlanDeps,
 } from "./plan.ts";
-import { RateLimitError } from "./rate-limit.ts";
+import { LimitServiceUnavailableError, LOOKUP_LIMIT_UNAVAILABLE, RateLimitError } from "./rate-limit.ts";
 import type { PlanProgress } from "./plan-types.ts";
 import type { Place } from "./geo.ts";
 import { existsSync, readFileSync } from "node:fs";
@@ -319,6 +319,52 @@ describe("runPlan", () => {
     assert.deepEqual(waits, [2000]);
     assert.equal(result.ordered.length, 1);
     assert.equal(retryAfterSecFromError(new Error("Too many address lookups right now. Try again shortly. Retry-After: 4")), 4);
+  });
+
+  it("does not retry a 503 try-again-shortly error", async () => {
+    let geocodeCalls = 0;
+    await assert.rejects(
+      () =>
+        runPlan(
+          { start: { query: startPlace.query }, stops: ["606 TINA LN"] },
+          {
+            resolveStart: async () => startPlace,
+            geocodeBatch: async () => {
+              geocodeCalls += 1;
+              throw new LimitServiceUnavailableError();
+            },
+          },
+          { sleep: async () => undefined },
+        ),
+      (err: unknown) => err instanceof LimitServiceUnavailableError,
+    );
+    assert.equal(geocodeCalls, 1);
+    assert.equal(retryAfterSecFromError(new LimitServiceUnavailableError()), null);
+    assert.equal(retryAfterSecFromError(new Error(LOOKUP_LIMIT_UNAVAILABLE)), null);
+  });
+
+  it("cuts a 429 retry wait short when Stop fires", async () => {
+    const ctrl = new AbortController();
+    let geocodeCalls = 0;
+    const started = Date.now();
+    const pending = runPlan(
+      { start: { query: startPlace.query }, stops: ["606 TINA LN"] },
+      {
+        resolveStart: async () => startPlace,
+        geocodeBatch: async () => {
+          geocodeCalls += 1;
+          throw new RateLimitError("Too many address lookups right now. Try again shortly.", 60);
+        },
+      },
+      { signal: ctrl.signal },
+    );
+    setTimeout(() => ctrl.abort(), 15);
+    await assert.rejects(
+      () => pending,
+      (err: unknown) => err instanceof Error && err.name === "AbortError",
+    );
+    assert.equal(geocodeCalls, 1);
+    assert.ok(Date.now() - started < 2000);
   });
 
   it("does not retry a second 429", async () => {

@@ -1,5 +1,6 @@
 import type { Place } from "./geo.ts";
 import { normalizeGeocodeKey } from "./geo.ts";
+import { isStoppedError } from "./geo-http.ts";
 
 export const GEOCODE_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60;
 export const GEOCODE_MISS_TTL_SECONDS = 24 * 60 * 60;
@@ -74,9 +75,15 @@ export async function geocodeWithCache(
   if (hit !== undefined) {
     return hit ? { ...hit, query } : null;
   }
-  const place = await lookup(query);
-  await cache.set(query, place);
-  return place ? { ...place, query } : null;
+  try {
+    const place = await lookup(query);
+    await cache.set(query, place);
+    return place ? { ...place, query } : null;
+  } catch (err) {
+    if (isStoppedError(err)) throw err;
+    if (isUncacheableLookupError(err)) return null;
+    throw err;
+  }
 }
 
 export function isUncacheableLookupError(err: unknown): boolean {

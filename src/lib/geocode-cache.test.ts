@@ -9,6 +9,7 @@ import {
   GEOCODE_MISS_TTL_SECONDS,
   geocodeWithCache,
 } from "./geocode-cache.ts";
+import { geocodeListFallback, LookupTimeoutError, mapPool } from "./geo-http.ts";
 
 const sample: Place = {
   lat: 28.698,
@@ -93,12 +94,70 @@ describe("geocode cache", () => {
   it("does not cache a timed-out lookup as not-found", async () => {
     const cache = createMemoryGeocodeCache();
     const timeout = Object.assign(new Error("Lookup timed out"), { name: "TimeoutError" });
-    await assert.rejects(
-      () => geocodeWithCache("slow", cache, async () => {
-        throw timeout;
-      }),
-      (err: unknown) => err instanceof Error && err.name === "TimeoutError",
-    );
+    const place = await geocodeWithCache("slow", cache, async () => {
+      throw timeout;
+    });
+    assert.equal(place, null);
     assert.equal(await cache.get("slow"), undefined);
+  });
+
+  it("keeps a Census Stop as a hard stop and does not call ArcGIS", async () => {
+    let arcgis = 0;
+    await assert.rejects(
+      () =>
+        geocodeListFallback(
+          async () => {
+            throw new DOMException("Stopped", "AbortError");
+          },
+          async () => {
+            arcgis += 1;
+            return sample;
+          },
+        ),
+      (err: unknown) => err instanceof DOMException && err.name === "AbortError",
+    );
+    assert.equal(arcgis, 0);
+  });
+
+  it("falls back to ArcGIS when Census times out and the batch still completes", async () => {
+    const cache = createMemoryGeocodeCache();
+    const queries = ["slow census", "fast"];
+    const found = await mapPool(queries, 2, (query) =>
+      geocodeWithCache(query, cache, (next) =>
+        geocodeListFallback(
+          async () => {
+            if (next === "slow census") throw new LookupTimeoutError();
+            return { ...sample, query: next, label: `Census ${next}` };
+          },
+          async () => ({ ...sample, query: next, label: `ArcGIS ${next}` }),
+        ),
+      ),
+    );
+    assert.equal(found[0]?.label, "ArcGIS slow census");
+    assert.equal(found[1]?.label, "Census fast");
+    assert.equal(found.length, 2);
+  });
+
+  it("treats a double timeout as an uncached miss and continues the batch", async () => {
+    const cache = createMemoryGeocodeCache();
+    const queries = ["both timeout", "ok"];
+    const found = await mapPool(queries, 2, (query) =>
+      geocodeWithCache(query, cache, (next) =>
+        geocodeListFallback(
+          async () => {
+            if (next === "both timeout") throw new LookupTimeoutError();
+            return { ...sample, query: next };
+          },
+          async () => {
+            if (next === "both timeout") throw new LookupTimeoutError();
+            return { ...sample, query: next };
+          },
+        ),
+      ),
+    );
+    assert.equal(found[0], null);
+    assert.ok(found[1]);
+    assert.equal(await cache.get("both timeout"), undefined);
+    assert.ok(await cache.get("ok"));
   });
 });

@@ -6,7 +6,14 @@ import {
   type LatLng,
   type Place,
 } from "./geo";
-import { fetchJson, isLookupTimeoutError, isStoppedError, listProviderFetchOpts, mapPool } from "./geo-http.ts";
+import {
+  fetchJson,
+  geocodeListFallback,
+  isLookupTimeoutError,
+  isStoppedError,
+  listProviderFetchOpts,
+  mapPool,
+} from "./geo-http.ts";
 import { geocodeWithCache } from "./geocode-cache.ts";
 import { planFromOsrmTable } from "./osrm.ts";
 import {
@@ -193,16 +200,17 @@ async function resolveStart(start: z.infer<typeof startInput>): Promise<Place> {
 
 /** List + start geocode: Census, then ArcGIS. No Photon/Nominatim, no variant fan-out. */
 async function geocodeListOne(query: string, bias?: LatLng): Promise<Place | null> {
-  const census = await censusGeocode(query, {
-    timeoutMs: LIST_GEOCODE_TIMEOUT_MS,
-    attempts: LIST_GEOCODE_ATTEMPTS,
-  });
-  if (census) return { ...census, query };
-  const arcgis = await arcgisGeocode(query, bias, {
-    timeoutMs: LIST_GEOCODE_TIMEOUT_MS,
-    attempts: LIST_GEOCODE_ATTEMPTS,
-  });
-  return arcgis ? { ...arcgis, query } : null;
+  const opts = { timeoutMs: LIST_GEOCODE_TIMEOUT_MS, attempts: LIST_GEOCODE_ATTEMPTS };
+  return geocodeListFallback(
+    async () => {
+      const census = await censusGeocode(query, opts);
+      return census ? { ...census, query } : null;
+    },
+    async () => {
+      const arcgis = await arcgisGeocode(query, bias, opts);
+      return arcgis ? { ...arcgis, query } : null;
+    },
+  );
 }
 
 async function photonSuggest(query: string, bias?: LatLng, limit = 6): Promise<Place[]> {
