@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { orderNearestByHaversine } from "./geo.ts";
+import { stitchRoadHeadToTail } from "./osrm.ts";
 import {
   assembleStraightPlan,
   formatPlanProgress,
   GEOCODE_BATCH_SIZE,
   MAX_PLAN_STOPS,
   planProgressView,
+  ROAD_REFINE_MAX_STOPS,
   runPlan,
+  STRAIGHT_LINE_FALLBACK_NOTE,
   tooManyStopsMessage,
   type PlanDeps,
 } from "./plan.ts";
@@ -86,9 +90,10 @@ describe("runPlan", () => {
           return { query, place: placeFor(query, index) };
         });
       },
-      refineRoad: async () => {
+      refineRoad: async (_start, head) => {
         refineCalls += 1;
-        throw new Error("should not refine a 1,300-stop list");
+        assert.equal(head.length, ROAD_REFINE_MAX_STOPS);
+        return { ...assembleStraightPlan(startPlace, head), source: "road" };
       },
     };
 
@@ -103,10 +108,10 @@ describe("runPlan", () => {
       result.ordered.map((s) => s.place.query).sort(),
       stops.slice().sort(),
     );
-    assert.equal(result.source, "straight");
+    assert.equal(result.source, "road");
     assert.equal(resolveCalls, 1);
     assert.equal(geocodeCalls, Math.ceil(1300 / GEOCODE_BATCH_SIZE));
-    assert.equal(refineCalls, 0);
+    assert.equal(refineCalls, 1);
     assert.equal(queriesSeen.length, 1300);
     assert.ok(ms < 2000, `runPlan took ${ms.toFixed(1)}ms`);
     console.log(
@@ -168,24 +173,66 @@ describe("runPlan", () => {
     assert.equal(result.failures.length, 1);
   });
 
-  it("refines with road distances when the list is small enough", async () => {
-    const stops = ["a", "b"];
+  it("sends only the first 25 of the haversine chain to road refine and stitches the rest", async () => {
+    const stops = Array.from({ length: 40 }, (_, i) => `Stop ${i}`);
+    let refined: string[] = [];
+    const locatedPlaces = stops.map((query, i) => placeFor(query, i));
     const result = await runPlan(
       { start: { query: startPlace.query }, stops },
       {
         resolveStart: async () => startPlace,
         geocodeBatch: async ({ queries }) =>
-          queries.map((query, i) => ({ query, place: placeFor(query, i) })),
-        refineRoad: async (start, located) => ({
-          ...assembleStraightPlan(start, located.reverse()),
-          source: "road",
-        }),
+          queries.map((query) => ({
+            query,
+            place: locatedPlaces.find((place) => place.query === query) ?? null,
+          })),
+        refineRoad: async (origin, head) => {
+          refined = head.map((place) => place.query);
+          const chain = orderNearestByHaversine(origin, locatedPlaces);
+          assert.deepEqual(
+            head.map((place) => place.query),
+            chain.slice(0, ROAD_REFINE_MAX_STOPS).map((place) => place.query),
+          );
+          const reversed = [...head].reverse();
+          return { ...assembleStraightPlan(origin, reversed), source: "road" };
+        },
       },
     );
+    assert.equal(refined.length, 25);
     assert.equal(result.source, "road");
+    assert.equal(result.note, undefined);
+    const chain = orderNearestByHaversine(startPlace, locatedPlaces);
+    const expected = stitchRoadHeadToTail(
+      { ...assembleStraightPlan(startPlace, [...chain.slice(0, 25)].reverse()), source: "road" },
+      chain.slice(25),
+    );
     assert.deepEqual(
-      result.ordered.map((s) => s.place.query),
-      ["b", "a"],
+      result.ordered.map((item) => item.place.query),
+      expected.ordered.map((item) => item.place.query),
+    );
+  });
+
+  it("keeps the straight-line chain and shows the fallback note when OSRM fails", async () => {
+    const stops = Array.from({ length: 8 }, (_, i) => `Stop ${i}`);
+    const locatedPlaces = stops.map((query, i) => placeFor(query, i));
+    const result = await runPlan(
+      { start: { query: startPlace.query }, stops },
+      {
+        resolveStart: async () => startPlace,
+        geocodeBatch: async ({ queries }) =>
+          queries.map((query) => ({
+            query,
+            place: locatedPlaces.find((place) => place.query === query) ?? null,
+          })),
+        refineRoad: async () => null,
+      },
+    );
+    const chain = orderNearestByHaversine(startPlace, locatedPlaces);
+    assert.equal(result.source, "straight");
+    assert.equal(result.note, STRAIGHT_LINE_FALLBACK_NOTE);
+    assert.deepEqual(
+      result.ordered.map((item) => item.place.query),
+      chain.map((place) => place.query),
     );
   });
 

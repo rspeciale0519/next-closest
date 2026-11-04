@@ -16,6 +16,7 @@ export type PlanResult = {
   totalMeters: number;
   totalSeconds: number;
   source: "road" | "straight";
+  note?: string;
 };
 
 export type PlanProgress = {

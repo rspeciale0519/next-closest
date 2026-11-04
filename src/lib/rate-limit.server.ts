@@ -5,6 +5,7 @@ import {
   createMemoryLimiter,
   RATE_LIMIT_ADDRESSES_PER_HOUR,
   RATE_LIMIT_GEOCODE_BATCHES_PER_MINUTE,
+  RATE_LIMIT_OSRM_PER_SECOND,
   RATE_LIMIT_REQUESTS_PER_MINUTE,
   RateLimitError,
   type RateLimiter,
@@ -17,6 +18,7 @@ type Limiters = {
   interactive: RateLimiter;
   geocode: RateLimiter;
   addresses: RateLimiter;
+  osrm: RateLimiter;
 };
 
 let cached: Limiters | undefined;
@@ -59,6 +61,9 @@ export function getPlanLimiters(): Limiters {
     addresses:
       upstashLimiter(RATE_LIMIT_ADDRESSES_PER_HOUR, "1 h", "nc:rl:addr") ??
       createMemoryLimiter(RATE_LIMIT_ADDRESSES_PER_HOUR, 60 * 60_000),
+    osrm:
+      upstashLimiter(RATE_LIMIT_OSRM_PER_SECOND, "1 s", "nc:rl:osrm") ??
+      createMemoryLimiter(RATE_LIMIT_OSRM_PER_SECOND, 1000),
   };
   return cached;
 }
@@ -98,4 +103,10 @@ export async function enforcePlanLimit(opts: {
       addr.retryAfterSec,
     );
   }
+}
+
+/** Global 1 OSRM table call / second. Returns false instead of throwing. */
+export async function tryConsumeOsrmSlot(): Promise<boolean> {
+  const result = await getPlanLimiters().osrm.consume("global", 1);
+  return result.ok;
 }

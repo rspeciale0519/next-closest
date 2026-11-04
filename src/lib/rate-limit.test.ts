@@ -4,6 +4,7 @@ import {
   clientIpFromHeaders,
   createMemoryLimiter,
   RATE_LIMIT_ADDRESSES_PER_HOUR,
+  RATE_LIMIT_OSRM_PER_SECOND,
   RATE_LIMIT_REQUESTS_PER_MINUTE,
 } from "./rate-limit.ts";
 
@@ -25,6 +26,12 @@ describe("memory rate limiter", () => {
     assert.equal(first.ok, true);
     const blocked = await limiter.consume("2.2.2.2", 1);
     assert.equal(blocked.ok, false);
+  });
+
+  it("allows one OSRM table call per second then blocks", async () => {
+    const limiter = createMemoryLimiter(RATE_LIMIT_OSRM_PER_SECOND, 1000);
+    assert.equal((await limiter.consume("global")).ok, true);
+    assert.equal((await limiter.consume("global")).ok, false);
   });
 
   it("keeps IPs independent", async () => {

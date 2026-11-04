@@ -7,14 +7,21 @@ import {
   type LatLng,
   type Place,
 } from "./geo.ts";
+import { stitchRoadHeadToTail } from "./osrm.ts";
 import {
   GEOCODE_BATCH_SIZE,
   MAX_PLAN_STOPS,
   ROAD_REFINE_MAX_STOPS,
+  STRAIGHT_LINE_FALLBACK_NOTE,
 } from "./plan-limits.ts";
 import type { GeocodedStop, PlanFailure, PlanProgress, PlanResult, PlanStart } from "./plan-types.ts";
 
-export { MAX_PLAN_STOPS, GEOCODE_BATCH_SIZE, ROAD_REFINE_MAX_STOPS } from "./plan-limits.ts";
+export {
+  MAX_PLAN_STOPS,
+  GEOCODE_BATCH_SIZE,
+  ROAD_REFINE_MAX_STOPS,
+  STRAIGHT_LINE_FALLBACK_NOTE,
+} from "./plan-limits.ts";
 export type { GeocodedStop, PlanFailure, PlanProgress, PlanResult, PlanStart } from "./plan-types.ts";
 
 export type PlanDeps = {
@@ -24,7 +31,7 @@ export type PlanDeps = {
     bias?: LatLng;
     region?: string;
   }) => Promise<GeocodedStop[]>;
-  refineRoad?: (start: Place, stops: Place[]) => Promise<PlanResult>;
+  refineRoad?: (start: Place, stops: Place[]) => Promise<PlanResult | null>;
 };
 
 export type RunPlanOptions = {
@@ -200,20 +207,32 @@ export async function runPlan(
     };
   }
 
-  if (located.length <= ROAD_REFINE_MAX_STOPS && deps.refineRoad) {
+  throwIfAborted(signal);
+  notify({ phase: "order", done, total: stops.length });
+  await yieldFn();
+  const chain = orderNearestByHaversine(start, located);
+  const head = chain.slice(0, ROAD_REFINE_MAX_STOPS);
+  const tail = chain.slice(ROAD_REFINE_MAX_STOPS);
+
+  if (deps.refineRoad && head.length > 0) {
     throwIfAborted(signal);
     notify({ phase: "road", done, total: stops.length });
     await yieldFn();
     try {
-      const refined = await deps.refineRoad(start, located);
-      return { ...refined, failures: [...refined.failures, ...failures] };
-    } catch {
-      // fall through to straight-line nearest-neighbor
+      const refined = await deps.refineRoad(start, head);
+      if (refined?.source === "road" && refined.ordered.length === head.length) {
+        const stitched = stitchRoadHeadToTail(refined, tail);
+        return { ...stitched, failures: [...refined.failures, ...failures] };
+      }
+    } catch (err) {
+      if (isAbortError(err)) throw err;
     }
+    return {
+      ...assembleStraightPlan(start, chain),
+      failures,
+      note: STRAIGHT_LINE_FALLBACK_NOTE,
+    };
   }
 
-  throwIfAborted(signal);
-  notify({ phase: "order", done, total: stops.length });
-  await yieldFn();
-  return { ...assembleStraightPlan(start, orderNearestByHaversine(start, located)), failures };
+  return { ...assembleStraightPlan(start, chain), failures };
 }

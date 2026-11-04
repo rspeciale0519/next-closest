@@ -35,10 +35,17 @@ export const LIST_GEOCODE_TIMEOUT_MS = 4000;
 export const LIST_GEOCODE_ATTEMPTS = 1;
 
 /**
- * Max stops sent to the public OSRM table (start + this many <= 100).
- * Lists larger than this are ordered with haversine nearest-neighbor.
+ * After a full-list haversine chain, this many leading stops (plus the
+ * origin) go to one public OSRM table call. The rest stay straight-line.
+ * Public OSRM allows 100 coordinates; 1 + 25 is well under that.
  */
-export const ROAD_REFINE_MAX_STOPS = 99;
+export const ROAD_REFINE_MAX_STOPS = 25;
 
-/** OSRM route polylines stay on the original small-list path only. */
-export const ROAD_POLYLINE_MAX_STOPS = 25;
+/** Public OSRM table timeout. One attempt, then fall back to straight-line. */
+export const OSRM_TIMEOUT_MS = 8000;
+
+/** Shared across every Vercel instance when Redis is configured. */
+export const OSRM_GLOBAL_PER_SECOND = 1;
+
+export const STRAIGHT_LINE_FALLBACK_NOTE =
+  "Ordered by straight-line distance (driving times unavailable).";

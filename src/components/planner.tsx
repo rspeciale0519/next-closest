@@ -573,6 +573,7 @@ function Results({
           <span className="tabular-nums">{formatDuration(plan.totalSeconds)}</span>
           {plan.source === "straight" ? " · straight-line estimate" : " · road time"}
         </p>
+        {plan.note ? <p className="mt-1 text-xs text-muted">{plan.note}</p> : null}
       </div>
 
       <ol className="mt-4 flex flex-col">

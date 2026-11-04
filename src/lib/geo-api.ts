@@ -1,20 +1,19 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import {
-  buildDistanceMatrix,
   haversineMeters,
   normalizeGeocodeKey,
-  orderNearestNext,
   type LatLng,
   type Place,
 } from "./geo";
 import { fetchJson, mapPool } from "./geo-http.ts";
 import { geocodeWithCache } from "./geocode-cache.ts";
+import { planFromOsrmTable } from "./osrm.ts";
 import {
   GEOCODE_CONCURRENCY,
   LIST_GEOCODE_ATTEMPTS,
   LIST_GEOCODE_TIMEOUT_MS,
-  ROAD_POLYLINE_MAX_STOPS,
+  ROAD_REFINE_MAX_STOPS,
 } from "./plan-limits.ts";
 import type { GeocodedStop, OrderedStop, PlanFailure, PlanResult } from "./plan-types.ts";
 
@@ -51,7 +50,7 @@ const geocodeBatchInput = z.object({
 
 const refineInput = z.object({
   start: placeSchema,
-  stops: z.array(placeSchema).min(1).max(99),
+  stops: z.array(placeSchema).min(1).max(ROAD_REFINE_MAX_STOPS),
 });
 
 export type Suggestion = Place;
@@ -138,53 +137,14 @@ export const geocodeStops = createServerFn({ method: "POST" })
 
 export const refineRoadOrder = createServerFn({ method: "POST" })
   .validator((data) => refineInput.parse(data))
-  .handler(async ({ data }): Promise<PlanResult> => {
+  .handler(async ({ data }): Promise<PlanResult | null> => {
     const { enforcePlanLimit } = await import("./rate-limit.server.ts");
     await enforcePlanLimit({ kind: "interactive" });
-    return orderWithOptionalRoad(data.start, data.stops);
+    const { lookupOsrmTable } = await import("./osrm.server.ts");
+    const table = await lookupOsrmTable([data.start, ...data.stops]);
+    if (!table) return null;
+    return planFromOsrmTable(data.start, data.stops, table);
   });
-
-async function orderWithOptionalRoad(start: Place, stops: Place[]): Promise<PlanResult> {
-  const points: LatLng[] = [start, ...stops];
-  const road = await osrmTable(points);
-  const matrix = buildDistanceMatrix(points, road ?? undefined);
-  const order = orderNearestNext(matrix.meters);
-  const stopOrder = order.slice(1);
-
-  const ordered: OrderedStop[] = [];
-  let totalMeters = 0;
-  let totalSeconds = 0;
-  let prev = 0;
-  for (const idx of stopOrder) {
-    const legMeters = matrix.meters[prev][idx];
-    const legSeconds = matrix.seconds[prev][idx];
-    totalMeters += legMeters;
-    totalSeconds += legSeconds;
-    ordered.push({
-      place: stops[idx - 1],
-      legMeters,
-      legSeconds,
-    });
-    prev = idx;
-  }
-
-  const orderedPoints: LatLng[] = [start, ...ordered.map((s) => s.place)];
-  const straight = orderedPoints.map((p) => [p.lat, p.lng] as [number, number]);
-  const polyline =
-    stops.length <= ROAD_POLYLINE_MAX_STOPS
-      ? ((await osrmRoute(orderedPoints)) ?? straight)
-      : straight;
-
-  return {
-    start,
-    ordered,
-    failures: [],
-    polyline,
-    totalMeters,
-    totalSeconds,
-    source: matrix.source,
-  };
-}
 
 async function resolveStart(start: z.infer<typeof startInput>): Promise<Place> {
   if (start.coords) {
@@ -595,77 +555,6 @@ const US_STATE_ABBR: Record<string, string> = {
   wyoming: "WY",
   "district of columbia": "DC",
 };
-
-async function osrmTable(points: LatLng[]) {
-  if (points.length < 2) return null;
-  const coords = points.map((p) => `${p.lng},${p.lat}`).join(";");
-  const url = `https://router.project-osrm.org/table/v1/driving/${coords}?annotations=duration,distance`;
-  try {
-    const json = await fetchJson<{
-      code?: string;
-      distances?: Array<Array<number | null>>;
-      durations?: Array<Array<number | null>>;
-    }>(url, undefined, 15000);
-    if (json.code !== "Ok" || !json.distances || !json.durations) return null;
-    return { distances: json.distances, durations: json.durations };
-  } catch {
-    return null;
-  }
-}
-
-async function osrmRoute(points: LatLng[]): Promise<Array<[number, number]> | null> {
-  if (points.length < 2) return null;
-  const legs = await Promise.all(
-    points.slice(0, -1).map((from, i) => osrmLeg(from, points[i + 1])),
-  );
-  const line: Array<[number, number]> = [];
-  for (let i = 0; i < legs.length; i++) {
-    const from = points[i];
-    const to = points[i + 1];
-    const piece = clipLineToDestination(legs[i] ?? [[from.lat, from.lng], [to.lat, to.lng]], to);
-    if (line.length > 0) piece.shift();
-    line.push(...piece);
-  }
-  return line.length > 1 ? line : null;
-}
-
-async function osrmLeg(from: LatLng, to: LatLng): Promise<Array<[number, number]> | null> {
-  const coords = `${from.lng},${from.lat};${to.lng},${to.lat}`;
-  const url = `https://router.project-osrm.org/route/v1/driving/${coords}?overview=full&geometries=geojson&continue_straight=false`;
-  try {
-    const json = await fetchJson<{
-      code?: string;
-      routes?: Array<{ geometry?: { coordinates?: Array<[number, number]> } }>;
-    }>(url, undefined, 12000);
-    const raw = json.routes?.[0]?.geometry?.coordinates;
-    if (json.code !== "Ok" || !raw || raw.length === 0) return null;
-    return raw.map(([lng, lat]) => [lat, lng] as [number, number]);
-  } catch {
-    return null;
-  }
-}
-
-function clipLineToDestination(
-  line: Array<[number, number]>,
-  dest: LatLng,
-): Array<[number, number]> {
-  if (line.length === 0) return [[dest.lat, dest.lng]];
-  let bestI = line.length - 1;
-  let bestD = Infinity;
-  for (let i = 0; i < line.length; i++) {
-    const d = haversineMeters({ lat: line[i][0], lng: line[i][1] }, dest);
-    if (d <= bestD) {
-      bestD = d;
-      bestI = i;
-    }
-  }
-  const clipped = line.slice(0, bestI + 1);
-  const last = clipped[clipped.length - 1];
-  if (!last || haversineMeters({ lat: last[0], lng: last[1] }, dest) > 8) {
-    clipped.push([dest.lat, dest.lng]);
-  }
-  return clipped;
-}
 
 function streetFeatureToPlace(feature: PhotonFeature | undefined, query: string): Place | null {
   const coords = feature?.geometry?.coordinates;

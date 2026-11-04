@@ -15,6 +15,9 @@ export const RATE_LIMIT_GEOCODE_BATCHES_PER_MINUTE = 80;
  */
 export const RATE_LIMIT_ADDRESSES_PER_HOUR = 2500;
 
+/** One public OSRM table call per second, shared across instances. */
+export const RATE_LIMIT_OSRM_PER_SECOND = 1;
+
 export type ConsumeResult =
   | { ok: true }
   | { ok: false; retryAfterSec: number };
