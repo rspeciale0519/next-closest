@@ -4,6 +4,7 @@ import {
   type JWK,
   type JWTVerifyGetKey,
 } from "jose";
+import { authEnabledFromEnvValue } from "../../../scripts/auth-enabled.mjs";
 
 export const GATE_IDENTITY_HEADER = "x-grok-identity";
 export const GATE_JWKS_PATH = "/__gate/identity-key";
@@ -27,7 +28,7 @@ function env(key: string): string | undefined {
 }
 
 export function gateIdentityEnabled(): boolean {
-  return env("VITE_AUTH_ENABLED") !== "false" && Boolean(env("GROK_PROJECT_ID"));
+  return authEnabledFromEnvValue(env("VITE_AUTH_ENABLED")) && Boolean(env("GROK_PROJECT_ID"));
 }
 
 async function defaultJwksFetch(url: string): Promise<GateJwks | null> {

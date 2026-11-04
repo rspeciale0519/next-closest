@@ -1,4 +1,5 @@
 import type { Place } from "./geo";
+import { looksLikeFormula } from "./spreadsheet.ts";
 
 export function googleMapsDirUrl(places: Place[]): string {
   const addrs = places.map(navAddress).filter(Boolean);
@@ -51,11 +52,16 @@ function streetFromLabel(label: string): string {
   return label;
 }
 
+function copyableAddress(place: Place): string {
+  const raw = place.query || place.label;
+  if (looksLikeFormula(raw)) return "";
+  const normalized = raw.replace(/\s+/g, " ").trim();
+  if (!normalized || looksLikeFormula(normalized)) return "";
+  return normalized;
+}
+
 export function copyableStopList(ordered: Place[]): string {
-  return ordered
-    .map((place) => (place.query || place.label).replace(/\s+/g, " ").trim())
-    .filter(Boolean)
-    .join("\n");
+  return ordered.map(copyableAddress).filter(Boolean).join("\n");
 }
 
 export async function copyPlainText(text: string): Promise<void> {

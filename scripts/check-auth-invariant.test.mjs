@@ -29,7 +29,13 @@ function appEnvFetch(env) {
 test("the flag predicate matches src/lib/auth", () => {
   assert.equal(authEnabledFromEnvValue("false"), false);
   assert.equal(authEnabledFromEnvValue("true"), true);
-  assert.equal(authEnabledFromEnvValue(undefined), true);
+  assert.equal(authEnabledFromEnvValue("TRUE"), true);
+  assert.equal(authEnabledFromEnvValue(" True "), true);
+  assert.equal(authEnabledFromEnvValue(undefined), false);
+  assert.equal(authEnabledFromEnvValue(""), false);
+  assert.equal(authEnabledFromEnvValue("  "), false);
+  assert.equal(authEnabledFromEnvValue("1"), false);
+  assert.equal(authEnabledFromEnvValue("yes"), false);
 });
 
 test("reads the value a live dev server resolved", async () => {
@@ -39,8 +45,19 @@ test("reads the value a live dev server resolved", async () => {
   );
 });
 
-test("a server started without the flag reads as sign-in on", async () => {
-  assert.equal(await probeDevAuthEnabled("http://127.0.0.1:8080", appEnvFetch({})), true);
+test("a server started without the flag reads as sign-in off", async () => {
+  assert.equal(await probeDevAuthEnabled("http://127.0.0.1:8080", appEnvFetch({})), false);
+});
+
+test("an empty or whitespace flag reads as sign-in off", async () => {
+  assert.equal(
+    await probeDevAuthEnabled("http://127.0.0.1:8080", appEnvFetch({ VITE_AUTH_ENABLED: "" })),
+    false,
+  );
+  assert.equal(
+    await probeDevAuthEnabled("http://127.0.0.1:8080", appEnvFetch({ VITE_AUTH_ENABLED: "  " })),
+    false,
+  );
 });
 
 test("agreement passes", () => {

@@ -96,6 +96,18 @@ Once the decision is ON, build from
 `authMiddleware` on every server function and every query scoped by the
 verified `context.userId`** — never a client-sent id, never a demo/mock user.
 
+**`VITE_AUTH_ENABLED` is off unless it is an explicit `true`.** Unset, empty,
+or any other value (including `"false"`) means off. A fresh clone without
+`.grok/app-env.json` must stay signed-out / dev-user. Only set the flag to
+`true` after the OAuth allowlist check below.
+
+**Better Auth 1.7 OAuth callback.** Generic OAuth callbacks moved from
+`/api/auth/oauth2/callback/:id` to `/api/auth/callback/:id`. Before sign-in is
+ever turned on, confirm the preview OAuth client's redirect allowlist includes
+the new `/api/auth/callback/:id` path (and the deployed app's concrete callback
+URL). An allowlist that still only lists `/api/auth/oauth2/callback/:id` will
+break sign-in.
+
 ---
 
 ## Project instructions

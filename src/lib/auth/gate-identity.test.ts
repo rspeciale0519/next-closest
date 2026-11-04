@@ -211,6 +211,7 @@ describe("gateIdentityFromHeaders", () => {
   it("verifies the header token end to end and fails closed without it", async () => {
     const key = await makeKey("k1");
     const { fetchImpl } = staticJwks([key.jwk]);
+    process.env.VITE_AUTH_ENABLED = "true";
     process.env.GROK_PROJECT_ID = "proj-123";
     process.env.GROK_GATE_ORIGIN = ISSUER;
     try {
@@ -230,6 +231,7 @@ describe("gateIdentityFromHeaders", () => {
       );
       assert.equal(withoutToken, null);
     } finally {
+      delete process.env.VITE_AUTH_ENABLED;
       delete process.env.GROK_PROJECT_ID;
       delete process.env.GROK_GATE_ORIGIN;
     }
@@ -242,6 +244,7 @@ describe("gateIdentityFromHeaders", () => {
       fetchedFrom.push(url);
       return { keys: [key.jwk] };
     };
+    process.env.VITE_AUTH_ENABLED = "true";
     process.env.GROK_PROJECT_ID = "proj-123";
     delete process.env.GROK_GATE_ORIGIN;
     try {
@@ -262,6 +265,7 @@ describe("gateIdentityFromHeaders", () => {
         "https://gate.app-builder-testing.com/__gate/identity-key",
       );
     } finally {
+      delete process.env.VITE_AUTH_ENABLED;
       delete process.env.GROK_PROJECT_ID;
     }
   });
@@ -279,6 +283,28 @@ describe("gateIdentityFromHeaders", () => {
       );
       assert.equal(identity, null);
     } finally {
+      delete process.env.GROK_GATE_ORIGIN;
+    }
+  });
+
+  it("fails closed when VITE_AUTH_ENABLED is unset even with a project id", async () => {
+    const key = await makeKey("k1");
+    const { fetchImpl } = staticJwks([key.jwk]);
+    const prevAuth = process.env.VITE_AUTH_ENABLED;
+    delete process.env.VITE_AUTH_ENABLED;
+    process.env.GROK_PROJECT_ID = "proj-123";
+    process.env.GROK_GATE_ORIGIN = ISSUER;
+    try {
+      const token = await signToken(key, { sub: "user-1" });
+      const identity = await gateIdentityFromHeaders(
+        new Headers({ "x-grok-identity": token }),
+        fetchImpl,
+      );
+      assert.equal(identity, null);
+    } finally {
+      if (prevAuth === undefined) delete process.env.VITE_AUTH_ENABLED;
+      else process.env.VITE_AUTH_ENABLED = prevAuth;
+      delete process.env.GROK_PROJECT_ID;
       delete process.env.GROK_GATE_ORIGIN;
     }
   });
