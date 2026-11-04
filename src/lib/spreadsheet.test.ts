@@ -6,6 +6,7 @@ import {
   extractAddresses,
   inferHasHeaderRow,
   joinMappedAddress,
+  looksLikeFormula,
   normalizeAddress,
   SPREADSHEET_LIMITS,
   SpreadsheetError,
@@ -14,6 +15,7 @@ import {
 import {
   parseSpreadsheetFile,
   spreadsheetErrorMessage,
+  spreadsheetReadOptions,
   validateSpreadsheetFile,
 } from "./spreadsheet-file.ts";
 
@@ -167,13 +169,36 @@ describe("extractAddresses", () => {
     assert.deepEqual(result.skipped, [{ rowNumber: 3, reason: "missing_fields" }]);
   });
 
-  it("skips formula-like values", () => {
-    const result = extractAddresses(table(["Address"], [["=HYPERLINK(A1)"]]), {
-      mode: "single",
-      address: 0,
-    });
-    assert.deepEqual(result.added, []);
-    assert.deepEqual(result.skipped, [{ rowNumber: 2, reason: "invalid" }]);
+  it("skips formula-like values including + - tab and CR prefixes", () => {
+    const result = extractAddresses(
+      table(
+        ["Address"],
+        [
+          ["=HYPERLINK(A1)"],
+          ["@SUM(A1)"],
+          ["+cmd|' /C calc'!A0"],
+          ["-2+3+cmd|' /C calc'!A0"],
+          ["\t=HYPERLINK(A1)"],
+          ["\r@SUM(A1)"],
+          ["123 Main St, Orlando, FL"],
+          ["\t400 S Orange Ave, Orlando, FL"],
+        ],
+      ),
+      { mode: "single", address: 0 },
+    );
+    assert.deepEqual(result.added, [
+      "123 Main St, Orlando, FL",
+      "400 S Orange Ave, Orlando, FL",
+    ]);
+    assert.equal(result.skipped.every((row) => row.reason === "invalid"), true);
+    assert.equal(result.skipped.length, 6);
+  });
+
+  it("does not treat a house-number address as a formula", () => {
+    assert.equal(looksLikeFormula("123 Main St"), false);
+    assert.equal(looksLikeFormula("\t123 Main St"), false);
+    assert.equal(looksLikeFormula("+SUM(A1)"), true);
+    assert.equal(looksLikeFormula("-2+3+cmd"), true);
   });
 
   it("numbers data rows from 1 when there is no header row", () => {
@@ -336,16 +361,88 @@ describe("file validation and parsing", () => {
   });
 
   it("rejects a zip that advertises an encrypted workbook", async () => {
-    const file = new File([Uint8Array.from(encryptedPackageZip())], "secret.xlsx");
+    const file = new File([Uint8Array.from(testZip({ name: "EncryptedPackage" }))], "secret.xlsx");
     await assert.rejects(
       parseSpreadsheetFile(file),
       (err: unknown) => err instanceof SpreadsheetError && /password-protected/.test(err.message),
     );
   });
+
+  it("applies the row cap during parse and only reads the first sheet", () => {
+    const options = spreadsheetReadOptions();
+    assert.equal(options.sheetRows, SPREADSHEET_LIMITS.maxRows + 2);
+    assert.equal(options.sheets, 0);
+  });
+
+  it("reads only the first worksheet", async () => {
+    const workbook = utils.book_new();
+    utils.book_append_sheet(
+      workbook,
+      utils.aoa_to_sheet([["Address"], ["123 Main St, Orlando, FL"]]),
+      "First",
+    );
+    utils.book_append_sheet(
+      workbook,
+      utils.aoa_to_sheet([["Address"], ["999 Hidden Ave, Orlando, FL"]]),
+      "Second",
+    );
+    const parsed = await parseSpreadsheetFile(
+      new File([write(workbook, { bookType: "xlsx", type: "array" })], "two-sheets.xlsx"),
+    );
+    const result = extractAddresses(parsed, parsed.mapping);
+    assert.deepEqual(result.added, ["123 Main St, Orlando, FL"]);
+    assert.equal(result.added.includes("999 Hidden Ave, Orlando, FL"), false);
+  });
+
+  it("rejects a spreadsheet with too many columns", async () => {
+    const headers = ["Address", ...Array.from({ length: SPREADSHEET_LIMITS.maxColumns }, (_, i) => `C${i}`)];
+    const values = ["123 Main St", ...headers.slice(1).map(() => "x")];
+    await assert.rejects(
+      parseSpreadsheetFile(spreadsheetFile([headers, values], "wide.csv", "csv")),
+      (err: unknown) => err instanceof SpreadsheetError && /too many columns/.test(err.message),
+    );
+  });
+
+  it("accepts a spreadsheet at the column cap and clips oversized cells", async () => {
+    const headers = Array.from({ length: SPREADSHEET_LIMITS.maxColumns }, (_, i) =>
+      i === 0 ? "Address" : `Extra ${i}`,
+    );
+    const longNote = "N".repeat(SPREADSHEET_LIMITS.maxCellChars + 80);
+    const values = ["123 Main St, Orlando, FL", ...headers.slice(1).map((_, i) => (i === 0 ? longNote : "x"))];
+    const parsed = await parseSpreadsheetFile(spreadsheetFile([headers, values], "capped.csv", "csv"));
+    assert.equal(parsed.headers.length, SPREADSHEET_LIMITS.maxColumns);
+    assert.equal(parsed.rows[0][1]?.length, SPREADSHEET_LIMITS.maxCellChars);
+    const result = extractAddresses(parsed, parsed.mapping);
+    assert.deepEqual(result.added, ["123 Main St, Orlando, FL"]);
+  });
+
+  it("rejects a zip whose central directory cannot be read", async () => {
+    const file = new File([Uint8Array.from(testZip({ breakCentral: true }))], "broken.xlsx");
+    await assert.rejects(
+      parseSpreadsheetFile(file),
+      (err: unknown) => err instanceof SpreadsheetError && /could not be read|damaged/.test(err.message),
+    );
+  });
+
+  it("rejects ZIP64 size markers and traditional zip encryption", async () => {
+    await assert.rejects(
+      parseSpreadsheetFile(new File([Uint8Array.from(testZip({ uncompressed: 0xffffffff }))], "zip64.xlsx")),
+      (err: unknown) => err instanceof SpreadsheetError && /expands too far/.test(err.message),
+    );
+    await assert.rejects(
+      parseSpreadsheetFile(new File([Uint8Array.from(testZip({ flags: 0x0001 }))], "locked.xlsx")),
+      (err: unknown) => err instanceof SpreadsheetError && /password-protected/.test(err.message),
+    );
+  });
 });
 
-function encryptedPackageZip(): Uint8Array {
-  const name = "EncryptedPackage";
+function testZip(opts: {
+  name?: string;
+  flags?: number;
+  uncompressed?: number;
+  breakCentral?: boolean;
+} = {}): Uint8Array {
+  const name = opts.name ?? "xl/workbook.xml";
   const nameBytes = new TextEncoder().encode(name);
   const local = new Uint8Array(30 + nameBytes.length);
   const localView = new DataView(local.buffer);
@@ -356,6 +453,8 @@ function encryptedPackageZip(): Uint8Array {
   const central = new Uint8Array(46 + nameBytes.length);
   const centralView = new DataView(central.buffer);
   centralView.setUint32(0, 0x02014b50, true);
+  centralView.setUint16(8, opts.flags ?? 0, true);
+  centralView.setUint32(24, opts.uncompressed ?? 0, true);
   centralView.setUint16(28, nameBytes.length, true);
   centralView.setUint32(42, 0, true);
   central.set(nameBytes, 46);
@@ -366,7 +465,7 @@ function encryptedPackageZip(): Uint8Array {
   eocdView.setUint16(8, 1, true);
   eocdView.setUint16(10, 1, true);
   eocdView.setUint32(12, central.length, true);
-  eocdView.setUint32(16, local.length, true);
+  eocdView.setUint32(16, opts.breakCentral ? 0xfffffff0 : local.length, true);
 
   const out = new Uint8Array(local.length + central.length + eocd.length);
   out.set(local, 0);

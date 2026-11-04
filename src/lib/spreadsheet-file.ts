@@ -40,6 +40,21 @@ export function validateSpreadsheetFile(file: { name: string; size: number }): v
   }
 }
 
+export function spreadsheetReadOptions() {
+  return {
+    type: "array" as const,
+    dense: true,
+    cellFormula: false,
+    cellHTML: false,
+    cellStyles: false,
+    cellDates: false,
+    bookVBA: false,
+    raw: false,
+    sheetRows: SPREADSHEET_LIMITS.maxRows + 2,
+    sheets: 0,
+  };
+}
+
 export function spreadsheetErrorMessage(err: unknown): string {
   if (err instanceof SpreadsheetError) return err.message;
   const raw = err instanceof Error ? err.message : String(err);
@@ -57,16 +72,7 @@ export async function parseSpreadsheetFile(file: File): Promise<ParsedSpreadshee
   const { read, utils } = await import("xlsx");
   let workbook: WorkBook;
   try {
-    workbook = read(buffer, {
-      type: "array",
-      dense: true,
-      cellFormula: false,
-      cellHTML: false,
-      cellStyles: false,
-      cellDates: false,
-      bookVBA: false,
-      raw: false,
-    });
+    workbook = read(buffer, spreadsheetReadOptions());
   } catch (err) {
     throw new SpreadsheetError(spreadsheetErrorMessage(err));
   }
@@ -82,10 +88,15 @@ export async function parseSpreadsheetFile(file: File): Promise<ParsedSpreadshee
     raw: false,
     defval: "",
     blankrows: true,
-  }) as unknown[][])
-    .map((row) => row.map((cell) => String(cell ?? "").replace(/\s+/g, " ").trim()));
+  }) as unknown[][]).map((row) => row.map((cell) => clipCell(cell)));
 
   const rows = trimTrailingEmpty(rawRows);
+  const width = Math.max(...rows.map((row) => row.length), 1);
+  if (width > SPREADSHEET_LIMITS.maxColumns) {
+    throw new SpreadsheetError(
+      `That spreadsheet has too many columns. Use a file with ${SPREADSHEET_LIMITS.maxColumns} columns or fewer.`,
+    );
+  }
   if (rows.length === 0) {
     throw new SpreadsheetError("That spreadsheet does not have any addresses.");
   }
@@ -98,7 +109,6 @@ export async function parseSpreadsheetFile(file: File): Promise<ParsedSpreadshee
     throw tooManyRowsError();
   }
 
-  const width = Math.max(...rows.map((row) => row.length), 1);
   const headers = hasHeaderRow
     ? padHeaders(rows[0], width)
     : Array.from({ length: width }, (_, index) => `Column ${index + 1}`);
@@ -117,6 +127,13 @@ export async function parseSpreadsheetFile(file: File): Promise<ParsedSpreadshee
     hasHeaderRow,
     mapping: detectColumns(hasHeaderRow ? headers : []),
   };
+}
+
+function clipCell(value: unknown): string {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  return text.length > SPREADSHEET_LIMITS.maxCellChars
+    ? text.slice(0, SPREADSHEET_LIMITS.maxCellChars)
+    : text;
 }
 
 function padHeaders(row: string[], width: number): string[] {
@@ -171,8 +188,10 @@ function sniffKind(bytes: Uint8Array): "zip" | "ole" | "text" | "unknown" {
 
 function assertSafeZip(bytes: Uint8Array): void {
   const stats = zipCentralStats(bytes);
-  if (!stats) return;
-  if (stats.names.some((name) => /encryptedpackage|encryptioninfo/i.test(name))) {
+  if (!stats) {
+    throw new SpreadsheetError("That spreadsheet could not be read. It may be damaged.");
+  }
+  if (stats.encrypted || stats.names.some((name) => /encryptedpackage|encryptioninfo/i.test(name))) {
     throw new SpreadsheetError(
       "That spreadsheet is password-protected. Save it without a password and try again.",
     );
@@ -182,21 +201,30 @@ function assertSafeZip(bytes: Uint8Array): void {
   }
 }
 
-function zipCentralStats(bytes: Uint8Array): { totalUncompressed: number; names: string[] } | null {
+function zipCentralStats(
+  bytes: Uint8Array,
+): { totalUncompressed: number; names: string[]; encrypted: boolean } | null {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const eocd = findEocd(view, bytes.length);
   if (eocd < 0) return null;
   const count = view.getUint16(eocd + 10, true);
   let offset = view.getUint32(eocd + 16, true);
   let totalUncompressed = 0;
+  let encrypted = false;
   const names: string[] = [];
   const decoder = new TextDecoder("utf-8");
   for (let i = 0; i < count; i += 1) {
     if (offset + 46 > bytes.length || view.getUint32(offset, true) !== 0x02014b50) return null;
+    const flags = view.getUint16(offset + 8, true);
+    const compressed = view.getUint32(offset + 20, true);
     const uncompressed = view.getUint32(offset + 24, true);
     const nameLen = view.getUint16(offset + 28, true);
     const extraLen = view.getUint16(offset + 30, true);
     const commentLen = view.getUint16(offset + 32, true);
+    if (flags & 0x0001 || flags & 0x0040) encrypted = true;
+    if (compressed === 0xffffffff || uncompressed === 0xffffffff) {
+      throw new SpreadsheetError("That spreadsheet expands too far to open safely.");
+    }
     if (uncompressed > MAX_UNCOMPRESSED) {
       throw new SpreadsheetError("That spreadsheet expands too far to open safely.");
     }
@@ -204,7 +232,7 @@ function zipCentralStats(bytes: Uint8Array): { totalUncompressed: number; names:
     totalUncompressed += uncompressed;
     offset += 46 + nameLen + extraLen + commentLen;
   }
-  return { totalUncompressed, names };
+  return { totalUncompressed, names, encrypted };
 }
 
 function findEocd(view: DataView, length: number): number {

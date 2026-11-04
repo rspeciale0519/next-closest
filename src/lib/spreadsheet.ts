@@ -2,6 +2,8 @@
 export const SPREADSHEET_LIMITS = {
   maxBytes: 5 * 1024 * 1024,
   maxRows: 2500,
+  maxColumns: 32,
+  maxCellChars: 300,
 } as const;
 
 export type SkipReason = "blank" | "duplicate" | "already_in_list" | "missing_fields" | "invalid";
@@ -164,6 +166,10 @@ export function extractAddresses(
       skipped.push({ rowNumber, reason: "missing_fields" });
       return;
     }
+    if (mappedValues(cells, mapping).some(looksLikeFormula)) {
+      skipped.push({ rowNumber, reason: "invalid" });
+      return;
+    }
     const address = joinMappedAddress(cells, mapping, table.headers);
     if (!address) {
       skipped.push({ rowNumber, reason: "blank" });
@@ -217,6 +223,7 @@ function sanitizeCell(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
-function looksLikeFormula(value: string): boolean {
-  return /^[=@]/.test(value);
+/** Spreadsheet formula / CSV-injection prefixes. Leading tab or CR only counts when it hides one of these. */
+export function looksLikeFormula(value: string): boolean {
+  return /^[\t\r]*[=@+\-]/.test(value);
 }

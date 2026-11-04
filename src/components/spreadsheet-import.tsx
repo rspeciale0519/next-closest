@@ -5,6 +5,7 @@ import { parseSpreadsheetFile, spreadsheetErrorMessage } from "@/lib/spreadsheet
 import {
   extractAddresses,
   skipReasonLabel,
+  SPREADSHEET_LIMITS,
   type ColumnMapping,
   type ImportResult,
   type SpreadsheetTable,
@@ -297,7 +298,7 @@ function ColumnSelect({
         onChange={(e) => onChange(e.target.value === "" ? undefined : Number(e.target.value))}
       >
         {optional ? <option value="">Not used</option> : null}
-        {headers.map((header, index) => (
+        {headers.slice(0, SPREADSHEET_LIMITS.maxColumns).map((header, index) => (
           <option key={`${header}-${index}`} value={index}>
             {header}
           </option>
