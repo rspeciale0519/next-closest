@@ -6,7 +6,7 @@ import {
   type LatLng,
   type Place,
 } from "./geo";
-import { fetchJson, listProviderFetchOpts, mapPool } from "./geo-http.ts";
+import { fetchJson, isLookupTimeoutError, isStoppedError, listProviderFetchOpts, mapPool } from "./geo-http.ts";
 import { geocodeWithCache } from "./geocode-cache.ts";
 import { planFromOsrmTable } from "./osrm.ts";
 import {
@@ -16,7 +16,7 @@ import {
   ROAD_REFINE_MAX_STOPS,
 } from "./plan-limits.ts";
 import { isLimitClosedError, isLimitResponseError, rethrowLimitError } from "./rate-limit.ts";
-import { REVERSE_GEOCODER, reverseGeocodeUrl } from "./reverse-geocode.ts";
+import { REVERSE_GEOCODER, prepareReverseLookup, reverseGeocodeUrl } from "./reverse-geocode.ts";
 import type { GeocodedStop, OrderedStop, PlanFailure, PlanResult } from "./plan-types.ts";
 
 export { REVERSE_GEOCODER, reverseGeocodeUrl };
@@ -247,18 +247,20 @@ type ArcgisAddress = {
 };
 
 async function arcgisReverse(coords: LatLng, featureTypes?: string): Promise<Place | null> {
-  const url = reverseGeocodeUrl(coords, featureTypes);
+  const signal = await inboundSignal();
+  const fetchOpts = await prepareReverseLookup(takeSharedGeocodeSlot, signal);
   try {
     const json = await fetchJson<{
       address?: ArcgisAddress;
       location?: { x?: number; y?: number };
-    }>(url);
+    }>(reverseGeocodeUrl(coords, featureTypes), undefined, fetchOpts);
     const label = formatArcgisStreet(json.address);
     const lat = json.location?.y;
     const lng = json.location?.x;
     if (!label || !Number.isFinite(lat) || !Number.isFinite(lng)) return null;
     return { lat: lat as number, lng: lng as number, query: label, label };
-  } catch {
+  } catch (err) {
+    if (isLimitResponseError(err) || isStoppedError(err) || isLookupTimeoutError(err)) throw err;
     return null;
   }
 }
@@ -360,7 +362,7 @@ async function arcgisGeocode(
       label: titleCaseAddress(top.attributes?.Match_addr || top.address || query),
     };
   } catch (err) {
-    if (isLimitResponseError(err)) throw err;
+    if (isLimitResponseError(err) || isStoppedError(err) || isLookupTimeoutError(err)) throw err;
     return null;
   }
 }
@@ -401,7 +403,7 @@ async function censusGeocode(
       label: titleCaseAddress(match.matchedAddress || query),
     };
   } catch (err) {
-    if (isLimitResponseError(err)) throw err;
+    if (isLimitResponseError(err) || isStoppedError(err) || isLookupTimeoutError(err)) throw err;
     return null;
   }
 }

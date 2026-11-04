@@ -31,6 +31,24 @@ export type FetchJsonOptions = {
   signal?: AbortSignal;
 };
 
+export class LookupTimeoutError extends Error {
+  constructor(message = "Lookup timed out") {
+    super(message);
+    this.name = "TimeoutError";
+  }
+}
+
+export function isStoppedError(err: unknown): boolean {
+  return (
+    (err instanceof DOMException && err.name === "AbortError") ||
+    (err instanceof Error && err.name === "AbortError")
+  );
+}
+
+export function isLookupTimeoutError(err: unknown): boolean {
+  return err instanceof LookupTimeoutError || (err instanceof Error && err.name === "TimeoutError");
+}
+
 export function listProviderFetchOpts(
   fetchOpts?: { timeoutMs?: number; attempts?: number },
   signal?: AbortSignal,
@@ -87,11 +105,17 @@ export async function fetchJson<T>(
       return (await res.json()) as T;
     } catch (err) {
       lastError = err;
-      if (opts.signal?.aborted || (err instanceof DOMException && err.name === "AbortError" && opts.signal)) {
+      if (opts.signal?.aborted) {
         throw new DOMException("Stopped", "AbortError");
       }
-      const retryable =
-        (err instanceof Error && err.name === "AbortError") || err instanceof TypeError;
+      if (err instanceof Error && err.name === "AbortError") {
+        if (attempt < attempts - 1) {
+          await sleep(Math.min(400 * 2 ** attempt, 4000));
+          continue;
+        }
+        throw new LookupTimeoutError();
+      }
+      const retryable = err instanceof TypeError;
       if (attempt < attempts - 1 && retryable) {
         await sleep(Math.min(400 * 2 ** attempt, 4000));
         continue;

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { fetchJson, GEOCODE_USER_AGENT, listProviderFetchOpts } from "./geo-http.ts";
+import { fetchJson, GEOCODE_USER_AGENT, listProviderFetchOpts, LookupTimeoutError } from "./geo-http.ts";
 import { LIST_GEOCODE_ATTEMPTS, LIST_GEOCODE_TIMEOUT_MS, PLAN_FN_MAX_DURATION_SECONDS } from "./plan-limits.ts";
 
 describe("list geocode budget", () => {
@@ -37,5 +37,30 @@ describe("list geocode budget", () => {
         }),
       (err: unknown) => err instanceof DOMException && err.name === "AbortError",
     );
+  });
+
+  it("treats the timer abort as a timeout when Stop did not fire", async () => {
+    const ctrl = new AbortController();
+    const original = globalThis.fetch;
+    globalThis.fetch = (_input, init) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      });
+    try {
+      await assert.rejects(
+        () =>
+          fetchJson("https://example.invalid/geocode", undefined, {
+            signal: ctrl.signal,
+            attempts: 1,
+            timeoutMs: 20,
+          }),
+        (err: unknown) => err instanceof LookupTimeoutError && err.name === "TimeoutError",
+      );
+      assert.equal(ctrl.signal.aborted, false);
+    } finally {
+      globalThis.fetch = original;
+    }
   });
 });

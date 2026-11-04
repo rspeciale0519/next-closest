@@ -77,4 +77,28 @@ describe("geocode cache", () => {
     assert.ok(await cache.get("b") === null);
     assert.ok(await cache.get("c"));
   });
+
+  it("does not cache an aborted lookup as not-found", async () => {
+    const cache = createMemoryGeocodeCache();
+    await assert.rejects(
+      () =>
+        geocodeWithCache("stopped", cache, async () => {
+          throw new DOMException("Stopped", "AbortError");
+        }),
+      (err: unknown) => err instanceof DOMException && err.name === "AbortError",
+    );
+    assert.equal(await cache.get("stopped"), undefined);
+  });
+
+  it("does not cache a timed-out lookup as not-found", async () => {
+    const cache = createMemoryGeocodeCache();
+    const timeout = Object.assign(new Error("Lookup timed out"), { name: "TimeoutError" });
+    await assert.rejects(
+      () => geocodeWithCache("slow", cache, async () => {
+        throw timeout;
+      }),
+      (err: unknown) => err instanceof Error && err.name === "TimeoutError",
+    );
+    assert.equal(await cache.get("slow"), undefined);
+  });
 });

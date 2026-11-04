@@ -78,3 +78,10 @@ export async function geocodeWithCache(
   await cache.set(query, place);
   return place ? { ...place, query } : null;
 }
+
+export function isUncacheableLookupError(err: unknown): boolean {
+  return (
+    (err instanceof DOMException && err.name === "AbortError") ||
+    (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError"))
+  );
+}
