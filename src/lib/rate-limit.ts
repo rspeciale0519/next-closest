@@ -45,6 +45,7 @@ export type RateLimiter = {
 };
 
 export class RateLimitError extends Error {
+  readonly status = 429;
   readonly retryAfterSec: number;
   constructor(message = "Too many requests. Wait a minute and try again.", retryAfterSec = 60) {
     super(message);
@@ -61,10 +62,39 @@ export class LimitServiceUnavailableError extends Error {
   }
 }
 
+export const UPSTASH_LIMIT_TIMEOUT_MS = 1500;
+
 export function limitFailClosedFromEnv(
   env: Record<string, string | undefined> = process.env,
 ): boolean {
-  return env.NODE_ENV === "production" || env.VERCEL === "1";
+  return (
+    env.NODE_ENV === "production" ||
+    env.VERCEL === "1" ||
+    env.VERCEL_ENV === "production"
+  );
+}
+
+/** Upstash `timeout` resolves `{ success: true, reason: "timeout" }` — allow. Production must deny. */
+export function consumeUpstashResult(
+  result: { success: boolean; reason?: string; reset?: number },
+  failClosed: boolean,
+  now = Date.now,
+): ConsumeResult {
+  if (result.reason === "timeout") {
+    if (failClosed) {
+      return {
+        ok: false,
+        retryAfterSec: Math.max(1, Math.ceil(UPSTASH_LIMIT_TIMEOUT_MS / 1000)),
+        unavailable: true,
+      };
+    }
+    return { ok: true };
+  }
+  if (result.success) return { ok: true };
+  return {
+    ok: false,
+    retryAfterSec: Math.max(1, Math.ceil(((result.reset ?? now() + 1000) - now()) / 1000)),
+  };
 }
 
 export function closedLimiter(): RateLimiter {
@@ -121,7 +151,9 @@ export function createMemoryLimiter(limit: number, windowMs: number): RateLimite
   };
 }
 
-export async function waitForOsrmSlot(
+export type SlotWaitResult = "ok" | "busy" | "unavailable";
+
+export async function waitForSharedSlot(
   consume: () => Promise<ConsumeResult>,
   options: {
     maxWaitMs?: number;
@@ -129,7 +161,7 @@ export async function waitForOsrmSlot(
     now?: () => number;
     signal?: AbortSignal;
   } = {},
-): Promise<boolean> {
+): Promise<SlotWaitResult> {
   const maxWaitMs = options.maxWaitMs ?? OSRM_SLOT_WAIT_MS;
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const now = options.now ?? Date.now;
@@ -139,13 +171,31 @@ export async function waitForOsrmSlot(
       throw new DOMException("Stopped", "AbortError");
     }
     const result = await consume();
-    if (result.ok) return true;
-    if (result.unavailable) return false;
+    if (result.ok) return "ok";
+    if (result.unavailable) return "unavailable";
     const remaining = maxWaitMs - (now() - started);
-    if (remaining <= 0) return false;
+    if (remaining <= 0) return "busy";
     const waitMs = Math.min(remaining, Math.max(1, result.retryAfterSec) * 1000);
     await sleep(waitMs);
   }
+}
+
+export async function waitForOsrmSlot(
+  consume: () => Promise<ConsumeResult>,
+  options: {
+    maxWaitMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+    now?: () => number;
+    signal?: AbortSignal;
+  } = {},
+): Promise<boolean> {
+  return (await waitForSharedSlot(consume, options)) === "ok";
+}
+
+export function throwSharedSlotFailure(outcome: SlotWaitResult, retryAfterSec = 2): void {
+  if (outcome === "ok") return;
+  if (outcome === "unavailable") throw new LimitServiceUnavailableError();
+  throw new RateLimitError("Too many address lookups right now. Try again shortly.", retryAfterSec);
 }
 
 export function clientIpFromHeaders(headers: Headers): string {
@@ -163,9 +213,23 @@ export function limitUnavailableResponse(): Response {
   });
 }
 
+export function rateLimitResponse(err: RateLimitError): Response {
+  return new Response(err.message, {
+    status: 429,
+    statusText: "Too Many Requests",
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
+      "Retry-After": String(Math.max(1, Math.floor(err.retryAfterSec))),
+    },
+  });
+}
+
 export function rethrowLimitError(err: unknown): never {
   if (err instanceof LimitServiceUnavailableError) {
     throw limitUnavailableResponse();
+  }
+  if (err instanceof RateLimitError) {
+    throw rateLimitResponse(err);
   }
   throw err;
 }
@@ -175,4 +239,15 @@ export function isLimitClosedError(err: unknown): boolean {
     err instanceof LimitServiceUnavailableError ||
     (typeof Response !== "undefined" && err instanceof Response && err.status === 503)
   );
+}
+
+export function isLimitBusyError(err: unknown): boolean {
+  return (
+    err instanceof RateLimitError ||
+    (typeof Response !== "undefined" && err instanceof Response && err.status === 429)
+  );
+}
+
+export function isLimitResponseError(err: unknown): boolean {
+  return isLimitClosedError(err) || isLimitBusyError(err);
 }

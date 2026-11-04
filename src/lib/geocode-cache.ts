@@ -2,6 +2,9 @@ import type { Place } from "./geo.ts";
 import { normalizeGeocodeKey } from "./geo.ts";
 
 export const GEOCODE_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60;
+export const GEOCODE_MISS_TTL_SECONDS = 24 * 60 * 60;
+/** One 2,500-stop list plus headroom for the start address and repeats. */
+export const GEOCODE_MEMORY_CACHE_MAX = 5000;
 
 export type CacheLookup = Place | null | undefined;
 
@@ -12,22 +15,52 @@ export type GeocodeCache = {
 
 type Entry = { value: Place | null; exp: number };
 
-export function createMemoryGeocodeCache(
-  ttlMs = GEOCODE_CACHE_TTL_SECONDS * 1000,
-  store: Map<string, Entry> = new Map(),
-): GeocodeCache {
+export type MemoryGeocodeCacheOptions = {
+  ttlMs?: number;
+  missTtlMs?: number;
+  maxEntries?: number;
+  now?: () => number;
+  store?: Map<string, Entry>;
+};
+
+export function cacheTtlSeconds(place: Place | null): number {
+  return place === null ? GEOCODE_MISS_TTL_SECONDS : GEOCODE_CACHE_TTL_SECONDS;
+}
+
+export function createMemoryGeocodeCache(options: MemoryGeocodeCacheOptions = {}): GeocodeCache {
+  const ttlMs = options.ttlMs ?? GEOCODE_CACHE_TTL_SECONDS * 1000;
+  const missTtlMs = options.missTtlMs ?? GEOCODE_MISS_TTL_SECONDS * 1000;
+  const maxEntries = options.maxEntries ?? GEOCODE_MEMORY_CACHE_MAX;
+  const store = options.store ?? new Map<string, Entry>();
+  const now = options.now ?? Date.now;
+
+  const evict = () => {
+    while (store.size > maxEntries) {
+      const oldest = store.keys().next().value;
+      if (oldest === undefined) break;
+      store.delete(oldest);
+    }
+  };
+
   return {
     async get(query: string) {
-      const row = store.get(normalizeGeocodeKey(query));
+      const key = normalizeGeocodeKey(query);
+      const row = store.get(key);
       if (!row) return undefined;
-      if (row.exp <= Date.now()) {
-        store.delete(normalizeGeocodeKey(query));
+      if (row.exp <= now()) {
+        store.delete(key);
         return undefined;
       }
+      store.delete(key);
+      store.set(key, row);
       return row.value;
     },
     async set(query: string, place: Place | null) {
-      store.set(normalizeGeocodeKey(query), { value: place, exp: Date.now() + ttlMs });
+      const key = normalizeGeocodeKey(query);
+      const ttl = place === null ? missTtlMs : ttlMs;
+      store.delete(key);
+      store.set(key, { value: place, exp: now() + ttl });
+      evict();
     },
   };
 }

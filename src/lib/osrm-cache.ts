@@ -3,6 +3,7 @@ import { osrmCacheKey, type OsrmTable } from "./osrm.ts";
 import type { LatLng } from "./geo.ts";
 
 export const OSRM_CACHE_TTL_SECONDS = GEOCODE_CACHE_TTL_SECONDS;
+export const OSRM_MEMORY_CACHE_MAX = 64;
 
 type Entry = { value: OsrmTable; exp: number };
 
@@ -14,7 +15,16 @@ export type OsrmTableCache = {
 export function createMemoryOsrmCache(
   ttlMs = OSRM_CACHE_TTL_SECONDS * 1000,
   store: Map<string, Entry> = new Map(),
+  maxEntries = OSRM_MEMORY_CACHE_MAX,
 ): OsrmTableCache {
+  const evict = () => {
+    while (store.size > maxEntries) {
+      const oldest = store.keys().next().value;
+      if (oldest === undefined) break;
+      store.delete(oldest);
+    }
+  };
+
   return {
     async get(points: LatLng[]) {
       const key = osrmCacheKey(points);
@@ -24,10 +34,15 @@ export function createMemoryOsrmCache(
         store.delete(key);
         return undefined;
       }
+      store.delete(key);
+      store.set(key, row);
       return row.value;
     },
     async set(points: LatLng[], table: OsrmTable) {
-      store.set(osrmCacheKey(points), { value: table, exp: Date.now() + ttlMs });
+      const key = osrmCacheKey(points);
+      store.delete(key);
+      store.set(key, { value: table, exp: Date.now() + ttlMs });
+      evict();
     },
   };
 }

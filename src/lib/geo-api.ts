@@ -6,7 +6,7 @@ import {
   type LatLng,
   type Place,
 } from "./geo";
-import { fetchJson, mapPool } from "./geo-http.ts";
+import { fetchJson, listProviderFetchOpts, mapPool } from "./geo-http.ts";
 import { geocodeWithCache } from "./geocode-cache.ts";
 import { planFromOsrmTable } from "./osrm.ts";
 import {
@@ -15,8 +15,11 @@ import {
   LIST_GEOCODE_TIMEOUT_MS,
   ROAD_REFINE_MAX_STOPS,
 } from "./plan-limits.ts";
-import { isLimitClosedError, rethrowLimitError } from "./rate-limit.ts";
+import { isLimitClosedError, isLimitResponseError, rethrowLimitError } from "./rate-limit.ts";
+import { REVERSE_GEOCODER, reverseGeocodeUrl } from "./reverse-geocode.ts";
 import type { GeocodedStop, OrderedStop, PlanFailure, PlanResult } from "./plan-types.ts";
+
+export { REVERSE_GEOCODER, reverseGeocodeUrl };
 
 const latLngSchema = z.object({
   lat: z.number().gte(-90).lte(90),
@@ -221,17 +224,13 @@ async function photonSuggest(query: string, bias?: LatLng, limit = 6): Promise<P
   }
 }
 
-async function placeForCoords(coords: LatLng): Promise<Place | null> {
+export async function placeForCoords(coords: LatLng): Promise<Place | null> {
   const numbered = (place: Place | null) => (place && /^\d+\s+\S/.test(place.label) ? place : null);
   return (
     numbered(await arcgisReverse(coords, "PointAddress,Subaddress,StreetAddress")) ||
     numbered(await arcgisReverse(coords)) ||
-    numbered(await nominatimReverse(coords)) ||
-    numbered(await photonReverse(coords)) ||
     (await arcgisReverse(coords, "PointAddress,Subaddress,StreetAddress")) ||
-    (await arcgisReverse(coords)) ||
-    (await nominatimReverse(coords)) ||
-    (await photonReverse(coords))
+    (await arcgisReverse(coords))
   );
 }
 
@@ -248,16 +247,12 @@ type ArcgisAddress = {
 };
 
 async function arcgisReverse(coords: LatLng, featureTypes?: string): Promise<Place | null> {
-  const url = new URL("https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/reverseGeocode");
-  url.searchParams.set("f", "json");
-  url.searchParams.set("location", `${coords.lng},${coords.lat}`);
-  url.searchParams.set("outSR", "4326");
-  if (featureTypes) url.searchParams.set("featureTypes", featureTypes);
+  const url = reverseGeocodeUrl(coords, featureTypes);
   try {
     const json = await fetchJson<{
       address?: ArcgisAddress;
       location?: { x?: number; y?: number };
-    }>(url.toString());
+    }>(url);
     const label = formatArcgisStreet(json.address);
     const lat = json.location?.y;
     const lng = json.location?.x;
@@ -288,61 +283,6 @@ function formatArcgisStreet(address?: ArcgisAddress): string | null {
   return formatUsAddress([street, city, region].filter(Boolean).join(", "));
 }
 
-async function nominatimReverse(coords: LatLng): Promise<Place | null> {
-  const url = new URL("https://nominatim.openstreetmap.org/reverse");
-  url.searchParams.set("lat", String(coords.lat));
-  url.searchParams.set("lon", String(coords.lng));
-  url.searchParams.set("format", "jsonv2");
-  url.searchParams.set("zoom", "18");
-  url.searchParams.set("addressdetails", "1");
-  try {
-    const json = await fetchJson<{
-      lat?: string;
-      lon?: string;
-      address?: {
-        house_number?: string;
-        road?: string;
-        pedestrian?: string;
-        city?: string;
-        town?: string;
-        village?: string;
-        hamlet?: string;
-        state?: string;
-        postcode?: string;
-      };
-    }>(url.toString());
-    const addr = json.address;
-    const lat = Number(json.lat);
-    const lng = Number(json.lon);
-    if (!addr || !Number.isFinite(lat) || !Number.isFinite(lng)) return null;
-    const street = [addr.house_number, addr.road || addr.pedestrian].filter(Boolean).join(" ");
-    if (!street) return null;
-    const city = addr.city || addr.town || addr.village || addr.hamlet;
-    const region = [stateAbbr(addr.state), addr.postcode].filter(Boolean).join(" ");
-    const label = formatUsAddress([street, city, region].filter(Boolean).join(", "));
-    return { lat, lng, query: label, label };
-  } catch {
-    return null;
-  }
-}
-
-async function photonReverse(coords: LatLng): Promise<Place | null> {
-  const url = new URL("https://photon.komoot.io/reverse");
-  url.searchParams.set("lat", String(coords.lat));
-  url.searchParams.set("lon", String(coords.lng));
-  try {
-    const json = await fetchJson<{ features?: PhotonFeature[] }>(url.toString());
-    const place = streetFeatureToPlace(
-      json.features?.[0],
-      `${coords.lat.toFixed(5)}, ${coords.lng.toFixed(5)}`,
-    );
-    if (!place) return null;
-    return place;
-  } catch {
-    return null;
-  }
-}
-
 type ArcgisResponse = {
   candidates?: Array<{
     address?: string;
@@ -352,10 +292,19 @@ type ArcgisResponse = {
   }>;
 };
 
-async function takeSharedGeocodeSlot(): Promise<void> {
+async function inboundSignal(): Promise<AbortSignal | undefined> {
+  try {
+    const { getRequest } = await import("@tanstack/react-start/server");
+    return getRequest()?.signal;
+  } catch {
+    return undefined;
+  }
+}
+
+async function takeSharedGeocodeSlot(signal?: AbortSignal): Promise<void> {
   try {
     const { consumeSharedGeocodeSlot } = await import("./rate-limit.server.ts");
-    await consumeSharedGeocodeSlot();
+    await consumeSharedGeocodeSlot(signal);
   } catch (err) {
     rethrowLimitError(err);
   }
@@ -366,7 +315,8 @@ async function arcgisGeocode(
   bias?: LatLng,
   fetchOpts?: { timeoutMs?: number; attempts?: number },
 ): Promise<Place | null> {
-  await takeSharedGeocodeSlot();
+  const signal = await inboundSignal();
+  await takeSharedGeocodeSlot(signal);
   const url = new URL("https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates");
   url.searchParams.set("f", "json");
   url.searchParams.set("singleLine", query);
@@ -375,10 +325,11 @@ async function arcgisGeocode(
   url.searchParams.set("countryCode", "USA");
   if (bias) url.searchParams.set("location", `${bias.lng},${bias.lat}`);
   try {
-    const json = await fetchJson<ArcgisResponse>(url.toString(), undefined, {
-      timeoutMs: fetchOpts?.timeoutMs ?? 12000,
-      attempts: fetchOpts?.attempts,
-    });
+    const json = await fetchJson<ArcgisResponse>(
+      url.toString(),
+      undefined,
+      listProviderFetchOpts(fetchOpts, signal),
+    );
     const places: Place[] = [];
     for (const hit of json.candidates ?? []) {
       const lat = hit.location?.y;
@@ -409,7 +360,7 @@ async function arcgisGeocode(
       label: titleCaseAddress(top.attributes?.Match_addr || top.address || query),
     };
   } catch (err) {
-    if (isLimitClosedError(err)) throw err;
+    if (isLimitResponseError(err)) throw err;
     return null;
   }
 }
@@ -427,16 +378,18 @@ async function censusGeocode(
   query: string,
   fetchOpts?: { timeoutMs?: number; attempts?: number },
 ): Promise<Place | null> {
-  await takeSharedGeocodeSlot();
+  const signal = await inboundSignal();
+  await takeSharedGeocodeSlot(signal);
   const url = new URL("https://geocoding.geo.census.gov/geocoder/locations/onelineaddress");
   url.searchParams.set("address", query);
   url.searchParams.set("benchmark", "Public_AR_Current");
   url.searchParams.set("format", "json");
   try {
-    const json = await fetchJson<CensusResponse>(url.toString(), undefined, {
-      timeoutMs: fetchOpts?.timeoutMs ?? 12000,
-      attempts: fetchOpts?.attempts,
-    });
+    const json = await fetchJson<CensusResponse>(
+      url.toString(),
+      undefined,
+      listProviderFetchOpts(fetchOpts, signal),
+    );
     const match = json.result?.addressMatches?.[0];
     const lng = match?.coordinates?.x;
     const lat = match?.coordinates?.y;
@@ -448,7 +401,7 @@ async function censusGeocode(
       label: titleCaseAddress(match.matchedAddress || query),
     };
   } catch (err) {
-    if (isLimitClosedError(err)) throw err;
+    if (isLimitResponseError(err)) throw err;
     return null;
   }
 }
@@ -585,25 +538,6 @@ const US_STATE_ABBR: Record<string, string> = {
   wyoming: "WY",
   "district of columbia": "DC",
 };
-
-function streetFeatureToPlace(feature: PhotonFeature | undefined, query: string): Place | null {
-  const coords = feature?.geometry?.coordinates;
-  if (!coords || coords.length < 2) return null;
-  const [lng, lat] = coords;
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
-  const props = feature?.properties;
-  const street = [props?.housenumber, props?.street || (props?.name && !props?.housenumber ? props.name : "")]
-    .filter(Boolean)
-    .join(" ");
-  const locality = props?.city || props?.town || props?.village || props?.locality;
-  const bits = [street, locality, props?.state, props?.postcode].filter(Boolean);
-  return {
-    lat,
-    lng,
-    query,
-    label: formatUsAddress(bits.join(", ") || query),
-  };
-}
 
 function featureToPlace(feature: PhotonFeature | undefined, query: string): Place | null {
   const coords = feature?.geometry?.coordinates;

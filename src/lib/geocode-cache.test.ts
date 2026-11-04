@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { Place } from "./geo.ts";
-import { createMemoryGeocodeCache, geocodeWithCache } from "./geocode-cache.ts";
+import {
+  cacheTtlSeconds,
+  createMemoryGeocodeCache,
+  GEOCODE_CACHE_TTL_SECONDS,
+  GEOCODE_MEMORY_CACHE_MAX,
+  GEOCODE_MISS_TTL_SECONDS,
+  geocodeWithCache,
+} from "./geocode-cache.ts";
 
 const sample: Place = {
   lat: 28.698,
@@ -41,5 +48,33 @@ describe("geocode cache", () => {
     assert.equal(first, null);
     assert.equal(second, null);
     assert.equal(upstream, 1);
+  });
+
+  it("uses a one-day TTL for not-found and evicts the oldest memory entry", async () => {
+    assert.equal(cacheTtlSeconds(sample), GEOCODE_CACHE_TTL_SECONDS);
+    assert.equal(cacheTtlSeconds(null), GEOCODE_MISS_TTL_SECONDS);
+    assert.equal(GEOCODE_MISS_TTL_SECONDS, 24 * 60 * 60);
+    assert.ok(GEOCODE_MEMORY_CACHE_MAX >= 2500);
+
+    const store = new Map();
+    let now = 1_000;
+    const cache = createMemoryGeocodeCache({
+      store,
+      maxEntries: 2,
+      now: () => now,
+    });
+    await cache.set("a", sample);
+    await cache.set("b", null);
+    const miss = store.get("b");
+    assert.ok(miss);
+    assert.equal(miss.exp - now, GEOCODE_MISS_TTL_SECONDS * 1000);
+    const hit = store.get("a");
+    assert.ok(hit);
+    assert.equal(hit.exp - now, GEOCODE_CACHE_TTL_SECONDS * 1000);
+
+    await cache.set("c", sample);
+    assert.equal(await cache.get("a"), undefined);
+    assert.ok(await cache.get("b") === null);
+    assert.ok(await cache.get("c"));
   });
 });

@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   clientIpFromHeaders,
   closedLimiter,
+  consumeUpstashResult,
   createMemoryLimiter,
   LimitServiceUnavailableError,
   LOOKUP_LIMIT_UNAVAILABLE,
@@ -12,8 +13,13 @@ import {
   RATE_LIMIT_GEOCODE_UPSTREAM_PER_SECOND,
   RATE_LIMIT_OSRM_PER_WINDOW,
   RATE_LIMIT_OSRM_WINDOW_MS,
+  RateLimitError,
+  rateLimitResponse,
   resolveLimiter,
+  throwSharedSlotFailure,
+  UPSTASH_LIMIT_TIMEOUT_MS,
   waitForOsrmSlot,
+  waitForSharedSlot,
   RATE_LIMIT_REQUESTS_PER_MINUTE,
 } from "./rate-limit.ts";
 import { MAX_PLAN_STOPS } from "./plan-limits.ts";
@@ -91,11 +97,25 @@ describe("clientIpFromHeaders", () => {
 });
 
 describe("fail-closed vs in-memory fallback", () => {
-  it("treats NODE_ENV=production or VERCEL=1 as fail closed", () => {
+  it("treats NODE_ENV=production, VERCEL=1, or VERCEL_ENV=production as fail closed", () => {
     assert.equal(limitFailClosedFromEnv({ NODE_ENV: "production" }), true);
     assert.equal(limitFailClosedFromEnv({ VERCEL: "1" }), true);
+    assert.equal(limitFailClosedFromEnv({ VERCEL_ENV: "production" }), true);
+    assert.equal(limitFailClosedFromEnv({ VERCEL_ENV: "preview" }), false);
     assert.equal(limitFailClosedFromEnv({ NODE_ENV: "test" }), false);
     assert.equal(limitFailClosedFromEnv({ NODE_ENV: "development" }), false);
+  });
+
+  it("treats an Upstash 1500ms timeout as a deny when fail-closed is on", () => {
+    const timeout = { success: true, reason: "timeout" as const, reset: 0 };
+    const denied = consumeUpstashResult(timeout, true);
+    assert.equal(denied.ok, false);
+    if (!denied.ok) {
+      assert.equal(denied.unavailable, true);
+      assert.equal(denied.retryAfterSec, Math.ceil(UPSTASH_LIMIT_TIMEOUT_MS / 1000));
+    }
+    assert.equal(consumeUpstashResult(timeout, false).ok, true);
+    assert.equal(UPSTASH_LIMIT_TIMEOUT_MS, 1500);
   });
 
   it("production missing Redis counts the limit as hit", async () => {
@@ -170,6 +190,47 @@ describe("limit unavailable error", () => {
     assert.equal(err.status, 503);
     assert.equal(err.message, LOOKUP_LIMIT_UNAVAILABLE);
     assert.equal(LOOKUP_LIMIT_UNAVAILABLE, "Lookup limit service unavailable, try again shortly");
+  });
+});
+
+describe("shared slot busy vs unavailable", () => {
+  it("returns busy when the slot never frees and unavailable without waiting", async () => {
+    let now = 0;
+    const busy = await waitForSharedSlot(async () => ({ ok: false, retryAfterSec: 2 }), {
+      now: () => now,
+      sleep: async (ms) => {
+        now += ms;
+      },
+    });
+    assert.equal(busy, "busy");
+    assert.equal(now, 4000);
+
+    now = 0;
+    const unavailable = await waitForSharedSlot(() => closedLimiter().consume("global"), {
+      now: () => now,
+      sleep: async (ms) => {
+        now += ms;
+      },
+    });
+    assert.equal(unavailable, "unavailable");
+    assert.equal(now, 0);
+  });
+
+  it("throws 429 with Retry-After when the shared slot is only busy", () => {
+    assert.throws(
+      () => throwSharedSlotFailure("busy", 3),
+      (err: unknown) => err instanceof RateLimitError && err.status === 429 && err.retryAfterSec === 3,
+    );
+    const response = rateLimitResponse(new RateLimitError("Too many address lookups right now. Try again shortly.", 3));
+    assert.equal(response.status, 429);
+    assert.equal(response.headers.get("Retry-After"), "3");
+  });
+
+  it("throws 503 when Redis is unavailable", () => {
+    assert.throws(
+      () => throwSharedSlotFailure("unavailable"),
+      (err: unknown) => err instanceof LimitServiceUnavailableError && err.status === 503,
+    );
   });
 });
 
