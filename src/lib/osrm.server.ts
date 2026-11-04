@@ -24,7 +24,7 @@ export async function lookupOsrmTable(
   if (points.length < 2) return null;
   const abort = inboundSignal(signal);
   return osrmTableWithCache(points, cache, async (next) => {
-    const allowed = await tryConsumeOsrmSlot();
+    const allowed = await tryConsumeOsrmSlot(abort);
     if (!allowed) return null;
     return fetchOsrmTable(next, abort);
   });

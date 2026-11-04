@@ -4,7 +4,7 @@ import { orderNearestByHaversine, type Place } from "./geo.ts";
 import { createMemoryOsrmCache, osrmTableWithCache } from "./osrm-cache.ts";
 import { osrmCacheKey, planFromOsrmTable, stitchRoadHeadToTail } from "./osrm.ts";
 import { assembleStraightPlan } from "./plan.ts";
-import { createMemoryLimiter, RATE_LIMIT_OSRM_PER_SECOND } from "./rate-limit.ts";
+import { createMemoryLimiter, RATE_LIMIT_OSRM_PER_WINDOW, RATE_LIMIT_OSRM_WINDOW_MS } from "./rate-limit.ts";
 
 const start: Place = {
   lat: 0,
@@ -130,8 +130,8 @@ describe("OSRM cache", () => {
 });
 
 describe("OSRM global cap", () => {
-  it("allows one call per second and blocks the next", async () => {
-    const limiter = createMemoryLimiter(RATE_LIMIT_OSRM_PER_SECOND, 1000);
+  it("allows one call every two seconds and blocks the next", async () => {
+    const limiter = createMemoryLimiter(RATE_LIMIT_OSRM_PER_WINDOW, RATE_LIMIT_OSRM_WINDOW_MS);
     assert.equal((await limiter.consume("global")).ok, true);
     const blocked = await limiter.consume("global");
     assert.equal(blocked.ok, false);

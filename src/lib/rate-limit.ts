@@ -1,3 +1,5 @@
+import { OSRM_GLOBAL_INTERVAL_MS, OSRM_SLOT_WAIT_MS } from "./plan-limits.ts";
+
 /** Per-IP burst cap for typeahead, reverse, start, and road refine. */
 export const RATE_LIMIT_REQUESTS_PER_MINUTE = 10;
 
@@ -15,8 +17,9 @@ export const RATE_LIMIT_GEOCODE_BATCHES_PER_MINUTE = 80;
  */
 export const RATE_LIMIT_ADDRESSES_PER_HOUR = 2500;
 
-/** One public OSRM table call per second, shared across instances. */
-export const RATE_LIMIT_OSRM_PER_SECOND = 1;
+/** One public OSRM table call per 2s, shared across instances. */
+export const RATE_LIMIT_OSRM_PER_WINDOW = 1;
+export { OSRM_GLOBAL_INTERVAL_MS as RATE_LIMIT_OSRM_WINDOW_MS, OSRM_SLOT_WAIT_MS };
 
 export type ConsumeResult =
   | { ok: true }
@@ -55,6 +58,32 @@ export function createMemoryLimiter(limit: number, windowMs: number): RateLimite
       return { ok: true };
     },
   };
+}
+
+export async function waitForOsrmSlot(
+  consume: () => Promise<ConsumeResult>,
+  options: {
+    maxWaitMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+    now?: () => number;
+    signal?: AbortSignal;
+  } = {},
+): Promise<boolean> {
+  const maxWaitMs = options.maxWaitMs ?? OSRM_SLOT_WAIT_MS;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const now = options.now ?? Date.now;
+  const started = now();
+  while (true) {
+    if (options.signal?.aborted) {
+      throw new DOMException("Stopped", "AbortError");
+    }
+    const result = await consume();
+    if (result.ok) return true;
+    const remaining = maxWaitMs - (now() - started);
+    if (remaining <= 0) return false;
+    const waitMs = Math.min(remaining, Math.max(1, result.retryAfterSec) * 1000);
+    await sleep(waitMs);
+  }
 }
 
 export function clientIpFromHeaders(headers: Headers): string {

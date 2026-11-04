@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import { OsrmAttribution } from "@/components/osrm-attribution";
 import { PlanProgressBar } from "@/components/plan-progress-bar";
 import { RouteMap } from "@/components/route-map";
 import { SpreadsheetImport } from "@/components/spreadsheet-import";
@@ -641,6 +642,7 @@ function Results({
           </Button>
         </div>
       </div>
+      <OsrmAttribution className="mt-3" />
     </div>
   );
 }

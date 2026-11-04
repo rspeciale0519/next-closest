@@ -5,7 +5,10 @@ import {
   createMemoryLimiter,
   RATE_LIMIT_ADDRESSES_PER_HOUR,
   RATE_LIMIT_GEOCODE_BATCHES_PER_MINUTE,
-  RATE_LIMIT_OSRM_PER_SECOND,
+  RATE_LIMIT_OSRM_PER_WINDOW,
+  RATE_LIMIT_OSRM_WINDOW_MS,
+  OSRM_SLOT_WAIT_MS,
+  waitForOsrmSlot,
   RATE_LIMIT_REQUESTS_PER_MINUTE,
   RateLimitError,
   type RateLimiter,
@@ -62,8 +65,8 @@ export function getPlanLimiters(): Limiters {
       upstashLimiter(RATE_LIMIT_ADDRESSES_PER_HOUR, "1 h", "nc:rl:addr") ??
       createMemoryLimiter(RATE_LIMIT_ADDRESSES_PER_HOUR, 60 * 60_000),
     osrm:
-      upstashLimiter(RATE_LIMIT_OSRM_PER_SECOND, "1 s", "nc:rl:osrm") ??
-      createMemoryLimiter(RATE_LIMIT_OSRM_PER_SECOND, 1000),
+      upstashLimiter(RATE_LIMIT_OSRM_PER_WINDOW, "2 s", "nc:rl:osrm") ??
+      createMemoryLimiter(RATE_LIMIT_OSRM_PER_WINDOW, RATE_LIMIT_OSRM_WINDOW_MS),
   };
   return cached;
 }
@@ -105,8 +108,10 @@ export async function enforcePlanLimit(opts: {
   }
 }
 
-/** Global 1 OSRM table call / second. Returns false instead of throwing. */
-export async function tryConsumeOsrmSlot(): Promise<boolean> {
-  const result = await getPlanLimiters().osrm.consume("global", 1);
-  return result.ok;
+/** Global 1 OSRM table call / 2s. Waits up to 4s, then returns false. */
+export async function tryConsumeOsrmSlot(signal?: AbortSignal): Promise<boolean> {
+  return waitForOsrmSlot(() => getPlanLimiters().osrm.consume("global", 1), {
+    maxWaitMs: OSRM_SLOT_WAIT_MS,
+    signal,
+  });
 }

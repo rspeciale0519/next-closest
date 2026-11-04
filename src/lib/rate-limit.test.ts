@@ -4,7 +4,9 @@ import {
   clientIpFromHeaders,
   createMemoryLimiter,
   RATE_LIMIT_ADDRESSES_PER_HOUR,
-  RATE_LIMIT_OSRM_PER_SECOND,
+  RATE_LIMIT_OSRM_PER_WINDOW,
+  RATE_LIMIT_OSRM_WINDOW_MS,
+  waitForOsrmSlot,
   RATE_LIMIT_REQUESTS_PER_MINUTE,
 } from "./rate-limit.ts";
 
@@ -28,10 +30,38 @@ describe("memory rate limiter", () => {
     assert.equal(blocked.ok, false);
   });
 
-  it("allows one OSRM table call per second then blocks", async () => {
-    const limiter = createMemoryLimiter(RATE_LIMIT_OSRM_PER_SECOND, 1000);
+  it("allows one OSRM table call every two seconds then blocks", async () => {
+    const limiter = createMemoryLimiter(RATE_LIMIT_OSRM_PER_WINDOW, RATE_LIMIT_OSRM_WINDOW_MS);
     assert.equal((await limiter.consume("global")).ok, true);
     assert.equal((await limiter.consume("global")).ok, false);
+  });
+
+  it("waits up to 4 seconds for a free OSRM slot then falls back", async () => {
+    let calls = 0;
+    const waits: number[] = [];
+    const ok = await waitForOsrmSlot(
+      async () => {
+        calls += 1;
+        if (calls === 1) return { ok: false, retryAfterSec: 2 };
+        return { ok: true };
+      },
+      { sleep: async (ms) => { waits.push(ms); } },
+    );
+    assert.equal(ok, true);
+    assert.deepEqual(waits, [2000]);
+
+    let now = 0;
+    const gaveUp = await waitForOsrmSlot(
+      async () => ({ ok: false, retryAfterSec: 2 }),
+      {
+        now: () => now,
+        sleep: async (ms) => {
+          now += ms;
+        },
+      },
+    );
+    assert.equal(gaveUp, false);
+    assert.equal(now, 4000);
   });
 
   it("keeps IPs independent", async () => {

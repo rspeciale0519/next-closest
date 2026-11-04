@@ -44,8 +44,13 @@ export const ROAD_REFINE_MAX_STOPS = 25;
 /** Public OSRM table timeout. One attempt, then fall back to straight-line. */
 export const OSRM_TIMEOUT_MS = 8000;
 
-/** Shared across every Vercel instance when Redis is configured. */
-export const OSRM_GLOBAL_PER_SECOND = 1;
+/**
+ * FOSSGIS public OSRM allows 1 request/second. We share 1 call / 2s across
+ * every instance so there is headroom. If the slot is busy, wait up to
+ * `OSRM_SLOT_WAIT_MS` then fall back to straight-line.
+ */
+export const OSRM_GLOBAL_INTERVAL_MS = 2000;
+export const OSRM_SLOT_WAIT_MS = 4000;
 
 export const STRAIGHT_LINE_FALLBACK_NOTE =
   "Ordered by straight-line distance (driving times unavailable).";

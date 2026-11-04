@@ -1,6 +1,7 @@
 import { Maximize2, Minimize2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { Place } from "@/lib/geo";
+import { OsrmAttribution } from "@/components/osrm-attribution";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -206,6 +207,10 @@ export function RouteMap({ start, stops = [], polyline = [], className }: RouteM
           <p className="pointer-events-none absolute bottom-4 left-4 z-10 max-w-sm rounded-md bg-surface/90 px-3 py-2 text-sm leading-snug text-muted shadow-border">
             Add a start and your stops — the driving order draws here.
           </p>
+        ) : stops.length > 0 ? (
+          <div className="pointer-events-auto absolute bottom-2 left-2 right-2 z-10 max-w-md rounded-md bg-surface/90 px-2.5 py-1.5 shadow-border">
+            <OsrmAttribution />
+          </div>
         ) : null}
       </div>
     </div>
