@@ -278,13 +278,26 @@ describe("file validation and parsing", () => {
     );
   });
 
+  it("accepts a file at the row limit", async () => {
+    const rows = [
+      ["Address"],
+      ...Array.from({ length: SPREADSHEET_LIMITS.maxRows }, (_, i) => [
+        `${i + 1} Main St, Orlando, FL`,
+      ]),
+    ];
+    const parsed = await parseSpreadsheetFile(spreadsheetFile(rows, "at-limit.csv", "csv"));
+    assert.equal(parsed.rows.length, SPREADSHEET_LIMITS.maxRows);
+  });
+
   it("rejects files over the row limit", async () => {
     const rows = [["Address"], ...Array.from({ length: SPREADSHEET_LIMITS.maxRows + 1 }, (_, i) => [
       `${i + 1} Main St, Orlando, FL`,
     ])];
     await assert.rejects(
       parseSpreadsheetFile(spreadsheetFile(rows, "too-many.csv", "csv")),
-      (err: unknown) => err instanceof SpreadsheetError && /500/.test(err.message),
+      (err: unknown) =>
+        err instanceof SpreadsheetError &&
+        err.message.includes(String(SPREADSHEET_LIMITS.maxRows)),
     );
   });
 

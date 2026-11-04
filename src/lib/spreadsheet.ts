@@ -1,7 +1,7 @@
 /** Caps for spreadsheet import. Keep file size and row count in this one place. */
 export const SPREADSHEET_LIMITS = {
   maxBytes: 5 * 1024 * 1024,
-  maxRows: 500,
+  maxRows: 2500,
 } as const;
 
 export type SkipReason = "blank" | "duplicate" | "already_in_list" | "missing_fields" | "invalid";

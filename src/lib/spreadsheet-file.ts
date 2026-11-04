@@ -16,6 +16,12 @@ export type ParsedSpreadsheet = SpreadsheetTable & {
   mapping: ColumnMapping;
 };
 
+function tooManyRowsError(): SpreadsheetError {
+  return new SpreadsheetError(
+    `That file has too many rows. Use a list of ${SPREADSHEET_LIMITS.maxRows} addresses or fewer.`,
+  );
+}
+
 export function fileExtension(name: string): string {
   const base = name.split(/[/\\]/).pop() ?? name;
   const dot = base.lastIndexOf(".");
@@ -84,12 +90,12 @@ export async function parseSpreadsheetFile(file: File): Promise<ParsedSpreadshee
     throw new SpreadsheetError("That spreadsheet does not have any addresses.");
   }
   if (rows.length > SPREADSHEET_LIMITS.maxRows + 1) {
-    throw new SpreadsheetError("That file has too many rows. Use a list of 500 addresses or fewer.");
+    throw tooManyRowsError();
   }
 
   const hasHeaderRow = inferHasHeaderRow(rows[0]);
   if (!hasHeaderRow && rows.length > SPREADSHEET_LIMITS.maxRows) {
-    throw new SpreadsheetError("That file has too many rows. Use a list of 500 addresses or fewer.");
+    throw tooManyRowsError();
   }
 
   const width = Math.max(...rows.map((row) => row.length), 1);
@@ -101,7 +107,7 @@ export async function parseSpreadsheetFile(file: File): Promise<ParsedSpreadshee
     throw new SpreadsheetError("That spreadsheet does not have any addresses.");
   }
   if (data.length > SPREADSHEET_LIMITS.maxRows) {
-    throw new SpreadsheetError("That file has too many rows. Use a list of 500 addresses or fewer.");
+    throw tooManyRowsError();
   }
 
   return {
