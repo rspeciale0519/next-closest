@@ -16,7 +16,10 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
+  geocodeStops,
   planRoute,
+  refineRoadOrder,
+  resolveStartPlace,
   reverseGeocode,
   suggestPlaces,
   type PlanResult,
@@ -25,6 +28,13 @@ import {
 import { extractAddressesFromImage } from "@/lib/vision-api";
 import { fileToImageDataUrl } from "@/lib/image-file";
 import { formatDuration, formatMiles, parseAddressList, type Place } from "@/lib/geo";
+import {
+  formatPlanProgress,
+  MAX_PLAN_STOPS,
+  runPlan,
+  tooManyStopsMessage,
+  type PlanProgress,
+} from "@/lib/plan";
 import { appleMapsDirUrl, copyableStopList, copyPlainText, googleMapsDirUrl } from "@/lib/maps-links";
 import { SAMPLE_START, SAMPLE_STOPS } from "@/lib/samples";
 import { loadPlanner, savePlanner } from "@/lib/storage";
@@ -40,6 +50,7 @@ export function Planner() {
   const [suggestOpen, setSuggestOpen] = useState(false);
   const [stopsText, setStopsText] = useState("");
   const [planning, setPlanning] = useState(false);
+  const [progress, setProgress] = useState<PlanProgress | null>(null);
   const [plan, setPlan] = useState<PlanResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
@@ -49,7 +60,9 @@ export function Planner() {
   const photoInputRef = useRef<HTMLInputElement>(null);
 
   const stopCount = parseAddressList(stopsText).length;
-  const canPlan = startQuery.trim().length > 0 && stopCount > 0 && !planning && !readingImage;
+  const overLimit = stopCount > MAX_PLAN_STOPS;
+  const canPlan =
+    startQuery.trim().length > 0 && stopCount > 0 && !overLimit && !planning && !readingImage;
 
   useEffect(() => {
     const stored = loadPlanner();
@@ -236,21 +249,35 @@ export function Planner() {
   async function onPlan() {
     const stops = parseAddressList(stopsText);
     if (!startQuery.trim() || stops.length === 0) return;
+    if (stops.length > MAX_PLAN_STOPS) {
+      setError(tooManyStopsMessage());
+      return;
+    }
     setPlanning(true);
+    setProgress(null);
     setError(null);
+    const start = {
+      query: startQuery.trim(),
+      coords: startPlace ? { lat: startPlace.lat, lng: startPlace.lng } : undefined,
+      label: startPlace?.label,
+    };
     try {
-      const result = await planRoute({
-        data: {
-          start: {
-            query: startQuery.trim(),
-            coords: startPlace
-              ? { lat: startPlace.lat, lng: startPlace.lng }
-              : undefined,
-            label: startPlace?.label,
-          },
-          stops,
-        },
-      });
+      const result =
+        stops.length <= 25
+          ? await planRoute({ data: { start, stops } })
+          : await runPlan(
+              { start, stops },
+              {
+                resolveStart: (value) => resolveStartPlace({ data: value }),
+                geocodeBatch: (data) => geocodeStops({ data }),
+                refineRoad: (origin, located) =>
+                  refineRoadOrder({ data: { start: origin, stops: located } }),
+              },
+              {
+                onProgress: setProgress,
+                yieldFn: () => new Promise((resolve) => window.setTimeout(resolve, 0)),
+              },
+            );
       setPlan(result);
       if (result.ordered.length === 0) {
         setError("None of those addresses could be found. Check spelling and try again.");
@@ -260,6 +287,7 @@ export function Planner() {
       setError(err instanceof Error ? err.message : "Could not order those stops.");
     } finally {
       setPlanning(false);
+      setProgress(null);
     }
   }
 
@@ -438,9 +466,9 @@ export function Planner() {
             </div>
           </div>
 
-          {error ? (
+          {error || overLimit ? (
             <p className="rounded-lg bg-danger/10 px-3 py-2 text-sm text-danger" role="alert">
-              {error}
+              {overLimit ? tooManyStopsMessage() : error}
             </p>
           ) : null}
 
@@ -448,7 +476,7 @@ export function Planner() {
             {planning ? (
               <>
                 <LoaderCircle className="size-4 animate-spin" />
-                Ordering stops
+                {progress ? formatPlanProgress(progress) : "Ordering stops"}
               </>
             ) : (
               "Order by next closest"
@@ -532,10 +560,16 @@ function Results({
       </ol>
 
       {plan.failures.length > 0 ? (
-        <div className="mt-2 rounded-md bg-surface-2 px-3 py-2 text-sm text-muted">
-          Skipped {plan.failures.length} unmatched{" "}
-          {plan.failures.length === 1 ? "address" : "addresses"}:{" "}
-          {plan.failures.map((f) => f.query).join("; ")}
+        <div className="mt-2 max-h-40 overflow-auto rounded-md bg-surface-2 px-3 py-2 text-sm text-muted">
+          <p>
+            Could not locate {plan.failures.length}{" "}
+            {plan.failures.length === 1 ? "address" : "addresses"}:
+          </p>
+          <ul className="mt-1 list-disc space-y-0.5 pl-4">
+            {plan.failures.map((failure) => (
+              <li key={failure.query}>{failure.query}</li>
+            ))}
+          </ul>
         </div>
       ) : null}
 

@@ -7,6 +7,8 @@ import {
   type LatLng,
   type Place,
 } from "./geo";
+import { GEOCODE_CONCURRENCY, ROAD_POLYLINE_MAX_STOPS } from "./plan-limits.ts";
+import type { GeocodedStop, OrderedStop, PlanFailure, PlanResult } from "./plan-types.ts";
 
 const UA = "NextClosest/1.0 (stop sequencer; https://grok.com)";
 
@@ -22,31 +24,42 @@ const suggestInput = z.object({
 
 const reverseInput = latLngSchema;
 
+const startInput = z.object({
+  query: z.string().trim().min(1).max(300),
+  coords: latLngSchema.optional(),
+  label: z.string().trim().max(300).optional(),
+});
+
+const placeSchema = z.object({
+  lat: z.number().gte(-90).lte(90),
+  lng: z.number().gte(-180).lte(180),
+  label: z.string().trim().min(1).max(300),
+  query: z.string().trim().min(1).max(300),
+});
+
+/**
+ * Small-list path (≤25 stops). The original `.max(25)` stays here so one
+ * serverless call still geocodes, asks OSRM for a table, and draws the road
+ * line. Larger lists are planned on the client via `geocodeStops` batches.
+ */
 const planInput = z.object({
-  start: z.object({
-    query: z.string().trim().min(1).max(300),
-    coords: latLngSchema.optional(),
-    label: z.string().trim().max(300).optional(),
-  }),
+  start: startInput,
   stops: z.array(z.string().trim().min(1).max(300)).min(1).max(25),
 });
 
+const geocodeBatchInput = z.object({
+  queries: z.array(z.string().trim().min(1).max(300)).min(1).max(20),
+  bias: latLngSchema.optional(),
+  region: z.string().trim().max(300).optional(),
+});
+
+const refineInput = z.object({
+  start: placeSchema,
+  stops: z.array(placeSchema).min(1).max(99),
+});
+
 export type Suggestion = Place;
-export type PlanFailure = { query: string; message: string };
-export type OrderedStop = {
-  place: Place;
-  legMeters: number;
-  legSeconds: number;
-};
-export type PlanResult = {
-  start: Place;
-  ordered: OrderedStop[];
-  failures: PlanFailure[];
-  polyline: Array<[number, number]>;
-  totalMeters: number;
-  totalSeconds: number;
-  source: "road" | "straight";
-};
+export type { GeocodedStop, OrderedStop, PlanFailure, PlanResult };
 
 type PhotonFeature = {
   geometry?: { coordinates?: [number, number] };
@@ -89,6 +102,40 @@ export const reverseGeocode = createServerFn({ method: "POST" })
     };
   });
 
+export const resolveStartPlace = createServerFn({ method: "POST" })
+  .validator((data) => startInput.parse(data))
+  .handler(async ({ data }): Promise<Place> => {
+    return resolveStart(data);
+  });
+
+export const geocodeStops = createServerFn({ method: "POST" })
+  .validator((data) => geocodeBatchInput.parse(data))
+  .handler(async ({ data }): Promise<GeocodedStop[]> => {
+    const unique: string[] = [];
+    const firstIndex = new Map<string, number>();
+    data.queries.forEach((query, index) => {
+      const key = query.trim().toLowerCase().replace(/\s+/g, " ");
+      if (!firstIndex.has(key)) {
+        firstIndex.set(key, unique.length);
+        unique.push(query);
+      }
+    });
+    const found = await mapPool(unique, GEOCODE_CONCURRENCY, (query) =>
+      geocodeOne(query, data.bias, data.region ?? ""),
+    );
+    return data.queries.map((query) => {
+      const key = query.trim().toLowerCase().replace(/\s+/g, " ");
+      const place = found[firstIndex.get(key) ?? 0] ?? null;
+      return { query, place };
+    });
+  });
+
+export const refineRoadOrder = createServerFn({ method: "POST" })
+  .validator((data) => refineInput.parse(data))
+  .handler(async ({ data }): Promise<PlanResult> => {
+    return orderWithOptionalRoad(data.start, data.stops);
+  });
+
 export const planRoute = createServerFn({ method: "POST" })
   .validator((data) => planInput.parse(data))
   .handler(async ({ data }): Promise<PlanResult> => {
@@ -119,46 +166,53 @@ export const planRoute = createServerFn({ method: "POST" })
       };
     }
 
-    const points: LatLng[] = [start, ...stops];
-    const road = await osrmTable(points);
-    const matrix = buildDistanceMatrix(points, road ?? undefined);
-    const order = orderNearestNext(matrix.meters);
-    const stopOrder = order.slice(1);
-
-    const ordered: OrderedStop[] = [];
-    let totalMeters = 0;
-    let totalSeconds = 0;
-    let prev = 0;
-    for (const idx of stopOrder) {
-      const legMeters = matrix.meters[prev][idx];
-      const legSeconds = matrix.seconds[prev][idx];
-      totalMeters += legMeters;
-      totalSeconds += legSeconds;
-      ordered.push({
-        place: stops[idx - 1],
-        legMeters,
-        legSeconds,
-      });
-      prev = idx;
-    }
-
-    const orderedPoints: LatLng[] = [start, ...ordered.map((s) => s.place)];
-    const polyline =
-      (await osrmRoute(orderedPoints)) ??
-      orderedPoints.map((p) => [p.lat, p.lng] as [number, number]);
-
-    return {
-      start,
-      ordered,
-      failures,
-      polyline,
-      totalMeters,
-      totalSeconds,
-      source: matrix.source,
-    };
+    const planned = await orderWithOptionalRoad(start, stops);
+    return { ...planned, failures };
   });
 
-async function resolveStart(start: z.infer<typeof planInput>["start"]): Promise<Place> {
+async function orderWithOptionalRoad(start: Place, stops: Place[]): Promise<PlanResult> {
+  const points: LatLng[] = [start, ...stops];
+  const road = await osrmTable(points);
+  const matrix = buildDistanceMatrix(points, road ?? undefined);
+  const order = orderNearestNext(matrix.meters);
+  const stopOrder = order.slice(1);
+
+  const ordered: OrderedStop[] = [];
+  let totalMeters = 0;
+  let totalSeconds = 0;
+  let prev = 0;
+  for (const idx of stopOrder) {
+    const legMeters = matrix.meters[prev][idx];
+    const legSeconds = matrix.seconds[prev][idx];
+    totalMeters += legMeters;
+    totalSeconds += legSeconds;
+    ordered.push({
+      place: stops[idx - 1],
+      legMeters,
+      legSeconds,
+    });
+    prev = idx;
+  }
+
+  const orderedPoints: LatLng[] = [start, ...ordered.map((s) => s.place)];
+  const straight = orderedPoints.map((p) => [p.lat, p.lng] as [number, number]);
+  const polyline =
+    stops.length <= ROAD_POLYLINE_MAX_STOPS
+      ? ((await osrmRoute(orderedPoints)) ?? straight)
+      : straight;
+
+  return {
+    start,
+    ordered,
+    failures: [],
+    polyline,
+    totalMeters,
+    totalSeconds,
+    source: matrix.source,
+  };
+}
+
+async function resolveStart(start: z.infer<typeof startInput>): Promise<Place> {
   if (start.coords) {
     const nearest = start.label?.trim()
       ? {
@@ -802,22 +856,71 @@ function formatPhoton(
   return label || fallback;
 }
 
-async function fetchJson<T>(url: string, init?: RequestInit, timeoutMs = 10000): Promise<T> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      ...init,
-      signal: ctrl.signal,
-      headers: {
-        Accept: "application/json",
-        "User-Agent": UA,
-        ...(init?.headers ?? {}),
-      },
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return (await res.json()) as T;
-  } finally {
-    clearTimeout(timer);
+async function mapPool<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      out[index] = await fn(items[index], index);
+    }
   }
+  const workers = Math.min(Math.max(1, limit), items.length);
+  await Promise.all(Array.from({ length: workers }, () => worker()));
+  return out;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchJson<T>(url: string, init?: RequestInit, timeoutMs = 10000): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        ...init,
+        signal: ctrl.signal,
+        headers: {
+          Accept: "application/json",
+          "User-Agent": UA,
+          ...(init?.headers ?? {}),
+        },
+      });
+      if (res.status === 429 || res.status >= 500) {
+        lastError = new Error(`HTTP ${res.status}`);
+        if (attempt < 3) {
+          const retryAfter = Number(res.headers.get("retry-after"));
+          const wait =
+            Number.isFinite(retryAfter) && retryAfter > 0
+              ? Math.min(retryAfter * 1000, 8000)
+              : Math.min(400 * 2 ** attempt, 4000);
+          await sleep(wait);
+          continue;
+        }
+        throw lastError;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return (await res.json()) as T;
+    } catch (err) {
+      lastError = err;
+      const retryable =
+        (err instanceof Error && err.name === "AbortError") || err instanceof TypeError;
+      if (attempt < 3 && retryable) {
+        await sleep(Math.min(400 * 2 ** attempt, 4000));
+        continue;
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw lastError;
 }
