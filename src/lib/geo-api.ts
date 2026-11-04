@@ -3,7 +3,7 @@ import { z } from "zod";
 import {
   buildDistanceMatrix,
   haversineMeters,
-  orderOpenTour,
+  orderNearestNext,
   type LatLng,
   type Place,
 } from "./geo";
@@ -122,8 +122,7 @@ export const planRoute = createServerFn({ method: "POST" })
     const points: LatLng[] = [start, ...stops];
     const road = await osrmTable(points);
     const matrix = buildDistanceMatrix(points, road ?? undefined);
-    const geographic = buildDistanceMatrix(points);
-    const order = orderOpenTour(geographic.meters);
+    const order = orderNearestNext(matrix.meters);
     const stopOrder = order.slice(1);
 
     const ordered: OrderedStop[] = [];

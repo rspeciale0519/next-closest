@@ -161,35 +161,71 @@ export function Planner() {
     setLocateStatus("idle");
   }
 
-  async function onPhotoSelected(file: File | undefined) {
-    if (!file) return;
+  async function onPhotosSelected(files: FileList | null) {
+    const selected = files ? Array.from(files) : [];
+    if (selected.length === 0) return;
     setReadingImage(true);
     setError(null);
+    const existing = parseAddressList(stopsText);
+    const seen = new Set(existing.map((line) => line.toLowerCase()));
+    const added: string[] = [];
+    const failed: string[] = [];
+    let empty = 0;
+    let found = 0;
     try {
-      const imageDataUrl = await fileToImageDataUrl(file);
-      const result = await extractAddressesFromImage({ data: { imageDataUrl } });
-      if (!result.ok) {
-        setError(result.error);
-        return;
+      for (let i = 0; i < selected.length; i++) {
+        const file = selected[i];
+        try {
+          const imageDataUrl = await fileToImageDataUrl(file);
+          const result = await extractAddressesFromImage({ data: { imageDataUrl } });
+          if (!result.ok) {
+            failed.push(result.error);
+            continue;
+          }
+          if (result.addresses.length === 0) {
+            empty += 1;
+            continue;
+          }
+          found += result.addresses.length;
+          for (const address of result.addresses) {
+            const key = address.toLowerCase();
+            if (seen.has(key)) continue;
+            seen.add(key);
+            added.push(address);
+          }
+        } catch (err) {
+          failed.push(err instanceof Error ? err.message : "Could not read a photo.");
+        }
       }
-      if (result.addresses.length === 0) {
-        setError("No street addresses found in that photo. Try a clearer screenshot.");
-        return;
-      }
-      const existing = parseAddressList(stopsText);
-      const seen = new Set(existing.map((line) => line.toLowerCase()));
-      const added = result.addresses.filter((address) => !seen.has(address.toLowerCase()));
+
       if (added.length === 0) {
-        toast.message("Those addresses are already in the list");
+        if (found > 0) {
+          toast.message("Those addresses are already in the list");
+          return;
+        }
+        setError(
+          failed[0] ??
+            (empty > 0
+              ? "No street addresses found in those photos. Try a clearer screenshot."
+              : "Could not read those photos."),
+        );
         return;
       }
+
       setStopsText([...existing, ...added].join("\n"));
       setPlan(null);
+      const photoLabel = selected.length === 1 ? "photo" : "photos";
       toast.success(
-        added.length === 1 ? "Added 1 address from photo" : `Added ${added.length} addresses from photo`,
+        added.length === 1
+          ? `Added 1 address from ${selected.length} ${photoLabel}`
+          : `Added ${added.length} addresses from ${selected.length} ${photoLabel}`,
       );
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not read that photo.");
+      if (failed.length > 0 || empty > 0) {
+        const skipped = failed.length + empty;
+        toast.message(
+          skipped === 1 ? "1 photo had no new addresses" : `${skipped} photos had no new addresses`,
+        );
+      }
     } finally {
       setReadingImage(false);
       if (photoInputRef.current) photoInputRef.current.value = "";
@@ -333,7 +369,7 @@ export function Planner() {
               ) : null}
             </div>
             <p className="mt-1 text-sm text-muted">
-              One address per line, or upload a screenshot of a job list.
+              One address per line, or upload photos of a job list.
             </p>
             <div className="mt-3">
               <label className="sr-only" htmlFor="stops">
@@ -362,15 +398,16 @@ export function Planner() {
                 ) : (
                   <ImagePlus className="size-3.5" />
                 )}
-                {readingImage ? "Reading photo" : "Upload photo"}
+                {readingImage ? "Reading photos" : "Upload photos"}
               </Button>
               <input
                 id="stop-photo"
                 ref={photoInputRef}
                 type="file"
                 accept="image/*"
+                multiple
                 className="hidden"
-                onChange={(e) => void onPhotoSelected(e.target.files?.[0])}
+                onChange={(e) => void onPhotosSelected(e.target.files)}
               />
               {stopCount > 0 ? (
                 <Button
