@@ -11,6 +11,7 @@ import {
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { RouteMap } from "@/components/route-map";
+import { SpreadsheetImport } from "@/components/spreadsheet-import";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -369,7 +370,7 @@ export function Planner() {
               ) : null}
             </div>
             <p className="mt-1 text-sm text-muted">
-              One address per line, or upload photos of a job list.
+              One address per line, a spreadsheet, or photos of a job list.
             </p>
             <div className="mt-3">
               <label className="sr-only" htmlFor="stops">
@@ -423,6 +424,17 @@ export function Planner() {
                   Clear
                 </Button>
               ) : null}
+            </div>
+            <div className="mt-3">
+              <SpreadsheetImport
+                existingAddresses={parseAddressList(stopsText)}
+                disabled={readingImage || planning}
+                onImport={(added) => {
+                  const existing = parseAddressList(stopsText);
+                  setStopsText([...existing, ...added].join("\n"));
+                  setPlan(null);
+                }}
+              />
             </div>
           </div>
 
