@@ -1,8 +1,15 @@
 import type { Place } from "./geo";
 import { looksLikeFormula } from "./spreadsheet.ts";
 
+/** Apple/Google Maps URLs only hand off this many ordered stops. */
+export const MAPS_HANDOFF_MAX_STOPS = 10;
+
+function mapsHandoffPlaces(places: Place[]): Place[] {
+  return places.slice(0, MAPS_HANDOFF_MAX_STOPS);
+}
+
 export function googleMapsDirUrl(places: Place[]): string {
-  const addrs = places.map(navAddress).filter(Boolean);
+  const addrs = mapsHandoffPlaces(places).map(navAddress).filter(Boolean);
   if (addrs.length === 0) return "https://www.google.com/maps";
   const params = new URLSearchParams({
     api: "1",
@@ -16,7 +23,7 @@ export function googleMapsDirUrl(places: Place[]): string {
 }
 
 export function appleMapsDirUrl(places: Place[]): string {
-  const addrs = places.map(navAddress).filter(Boolean);
+  const addrs = mapsHandoffPlaces(places).map(navAddress).filter(Boolean);
   if (addrs.length === 0) return "https://maps.apple.com/";
   const url = new URL("https://maps.apple.com/directions");
   url.searchParams.set("mode", "driving");
