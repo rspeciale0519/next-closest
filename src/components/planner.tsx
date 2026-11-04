@@ -10,13 +10,17 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import { OsrmAttribution } from "@/components/osrm-attribution";
+import { PlanProgressBar } from "@/components/plan-progress-bar";
 import { RouteMap } from "@/components/route-map";
 import { SpreadsheetImport } from "@/components/spreadsheet-import";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
-  planRoute,
+  geocodeStops,
+  refineRoadOrder,
+  resolveStartPlace,
   reverseGeocode,
   suggestPlaces,
   type PlanResult,
@@ -25,6 +29,14 @@ import {
 import { extractAddressesFromImage } from "@/lib/vision-api";
 import { fileToImageDataUrl } from "@/lib/image-file";
 import { formatDuration, formatMiles, parseAddressList, type Place } from "@/lib/geo";
+import {
+  formatPlanProgress,
+  isAbortError,
+  MAX_PLAN_STOPS,
+  runPlan,
+  tooManyStopsMessage,
+  type PlanProgress,
+} from "@/lib/plan";
 import { appleMapsDirUrl, copyableStopList, copyPlainText, googleMapsDirUrl } from "@/lib/maps-links";
 import { SAMPLE_START, SAMPLE_STOPS } from "@/lib/samples";
 import { loadPlanner, savePlanner } from "@/lib/storage";
@@ -40,6 +52,8 @@ export function Planner() {
   const [suggestOpen, setSuggestOpen] = useState(false);
   const [stopsText, setStopsText] = useState("");
   const [planning, setPlanning] = useState(false);
+  const [progress, setProgress] = useState<PlanProgress | null>(null);
+  const [previewProgress, setPreviewProgress] = useState<PlanProgress | null>(null);
   const [plan, setPlan] = useState<PlanResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
@@ -47,9 +61,14 @@ export function Planner() {
   const suggestTimer = useRef<number | null>(null);
   const startBoxRef = useRef<HTMLDivElement>(null);
   const photoInputRef = useRef<HTMLInputElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const aliveRef = useRef(true);
 
   const stopCount = parseAddressList(stopsText).length;
-  const canPlan = startQuery.trim().length > 0 && stopCount > 0 && !planning && !readingImage;
+  const overLimit = stopCount > MAX_PLAN_STOPS;
+  const barProgress = progress ?? previewProgress;
+  const canPlan =
+    startQuery.trim().length > 0 && stopCount > 0 && !overLimit && !planning && !readingImage;
 
   useEffect(() => {
     const stored = loadPlanner();
@@ -58,6 +77,23 @@ export function Planner() {
       setStopsText(stored.stopsText);
     }
     setHydrated(true);
+    if (!import.meta.env.DEV) return;
+    const raw = new URLSearchParams(window.location.search).get("progressPreview");
+    if (!raw) return;
+    const [doneRaw, totalRaw, phaseRaw] = raw.split("/");
+    const done = Number(doneRaw);
+    const total = Number(totalRaw);
+    if (!Number.isFinite(done) || !Number.isFinite(total) || total <= 0) return;
+    const phase = phaseRaw === "order" || phaseRaw === "road" ? phaseRaw : "geocode";
+    setPreviewProgress({ phase, done, total });
+  }, []);
+
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+      abortRef.current?.abort();
+    };
   }, []);
 
   useEffect(() => {
@@ -233,33 +269,64 @@ export function Planner() {
     }
   }
 
+  function stopPlan() {
+    abortRef.current?.abort();
+  }
+
   async function onPlan() {
     const stops = parseAddressList(stopsText);
     if (!startQuery.trim() || stops.length === 0) return;
+    if (stops.length > MAX_PLAN_STOPS) {
+      setError(tooManyStopsMessage());
+      return;
+    }
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    const signal = ctrl.signal;
     setPlanning(true);
+    setProgress({ phase: "geocode", done: 0, total: stops.length });
     setError(null);
+    const start = {
+      query: startQuery.trim(),
+      coords: startPlace ? { lat: startPlace.lat, lng: startPlace.lng } : undefined,
+      label: startPlace?.label,
+    };
     try {
-      const result = await planRoute({
-        data: {
-          start: {
-            query: startQuery.trim(),
-            coords: startPlace
-              ? { lat: startPlace.lat, lng: startPlace.lng }
-              : undefined,
-            label: startPlace?.label,
-          },
-          stops,
+      const result = await runPlan(
+        { start, stops },
+        {
+          resolveStart: (value) => resolveStartPlace({ data: value, signal }),
+          geocodeBatch: (data) => geocodeStops({ data, signal }),
+          refineRoad: (origin, located) =>
+            refineRoadOrder({ data: { start: origin, stops: located }, signal }),
         },
-      });
+        {
+          signal,
+          onProgress: (next) => {
+            if (!aliveRef.current || signal.aborted) return;
+            setProgress((prev) => {
+              if (!prev) return next;
+              return next.done < prev.done ? { ...next, done: prev.done } : next;
+            });
+          },
+          yieldFn: () => new Promise((resolve) => window.setTimeout(resolve, 0)),
+        },
+      );
+      if (!aliveRef.current || signal.aborted) return;
       setPlan(result);
       if (result.ordered.length === 0) {
         setError("None of those addresses could be found. Check spelling and try again.");
       }
     } catch (err) {
+      if (!aliveRef.current || signal.aborted || isAbortError(err)) return;
       setPlan(null);
       setError(err instanceof Error ? err.message : "Could not order those stops.");
     } finally {
+      if (abortRef.current === ctrl) abortRef.current = null;
+      if (!aliveRef.current) return;
       setPlanning(false);
+      setProgress(null);
     }
   }
 
@@ -438,22 +505,32 @@ export function Planner() {
             </div>
           </div>
 
-          {error ? (
+          {error || overLimit ? (
             <p className="rounded-lg bg-danger/10 px-3 py-2 text-sm text-danger" role="alert">
-              {error}
+              {overLimit ? tooManyStopsMessage() : error}
             </p>
           ) : null}
 
-          <Button size="lg" className="w-full" disabled={!canPlan} onClick={() => void onPlan()}>
-            {planning ? (
-              <>
+          {barProgress ? (
+            <PlanProgressBar progress={barProgress} className="rounded-xl bg-surface p-4 shadow-border" />
+          ) : null}
+
+          {planning ? (
+            <div className="flex flex-col gap-2">
+              <Button size="lg" className="w-full" disabled>
                 <LoaderCircle className="size-4 animate-spin" />
-                Ordering stops
-              </>
-            ) : (
-              "Order by next closest"
-            )}
-          </Button>
+                {progress ? formatPlanProgress(progress) : "Ordering stops"}
+              </Button>
+              <Button size="lg" variant="secondary" className="w-full" onClick={stopPlan}>
+                <X className="size-4" />
+                Stop
+              </Button>
+            </div>
+          ) : (
+            <Button size="lg" className="w-full" disabled={!canPlan} onClick={() => void onPlan()}>
+              Order by next closest
+            </Button>
+          )}
 
           {plan && plan.ordered.length > 0 ? (
             <Results plan={plan} onCopy={() => void copyList()} navPlaces={navPlaces} />
@@ -497,6 +574,7 @@ function Results({
           <span className="tabular-nums">{formatDuration(plan.totalSeconds)}</span>
           {plan.source === "straight" ? " · straight-line estimate" : " · road time"}
         </p>
+        {plan.note ? <p className="mt-1 text-xs text-muted">{plan.note}</p> : null}
       </div>
 
       <ol className="mt-4 flex flex-col">
@@ -532,10 +610,16 @@ function Results({
       </ol>
 
       {plan.failures.length > 0 ? (
-        <div className="mt-2 rounded-md bg-surface-2 px-3 py-2 text-sm text-muted">
-          Skipped {plan.failures.length} unmatched{" "}
-          {plan.failures.length === 1 ? "address" : "addresses"}:{" "}
-          {plan.failures.map((f) => f.query).join("; ")}
+        <div className="mt-2 max-h-40 overflow-auto rounded-md bg-surface-2 px-3 py-2 text-sm text-muted">
+          <p>
+            Could not locate {plan.failures.length}{" "}
+            {plan.failures.length === 1 ? "address" : "addresses"}:
+          </p>
+          <ul className="mt-1 list-disc space-y-0.5 pl-4">
+            {plan.failures.map((failure) => (
+              <li key={failure.query}>{failure.query}</li>
+            ))}
+          </ul>
         </div>
       ) : null}
 
@@ -558,6 +642,7 @@ function Results({
           </Button>
         </div>
       </div>
+      <OsrmAttribution className="mt-3" />
     </div>
   );
 }

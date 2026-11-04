@@ -19,6 +19,42 @@ export function parseAddressList(raw: string): string[] {
   return out;
 }
 
+/** ~35 mph, used when road times are unavailable. */
+export const STRAIGHT_LINE_MPS = 15.65;
+
+export function chunkItems<T>(items: T[], size: number): T[][] {
+  if (size <= 0) throw new Error("chunk size must be positive");
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+export function normalizeGeocodeKey(query: string): string {
+  return query.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+/** Greedy nearest-next using straight-line distance. O(n²) time, O(n) memory. */
+export function orderNearestByHaversine(start: LatLng, stops: Place[]): Place[] {
+  const remaining = stops.slice();
+  const ordered: Place[] = [];
+  let current: LatLng = start;
+  while (remaining.length > 0) {
+    let best = 0;
+    let bestD = Infinity;
+    for (let i = 0; i < remaining.length; i += 1) {
+      const d = haversineMeters(current, remaining[i]);
+      if (d < bestD) {
+        bestD = d;
+        best = i;
+      }
+    }
+    const next = remaining.splice(best, 1)[0];
+    ordered.push(next);
+    current = next;
+  }
+  return ordered;
+}
+
 export function haversineMeters(a: LatLng, b: LatLng): number {
   const r = 6371000;
   const dLat = toRad(b.lat - a.lat);
@@ -52,7 +88,7 @@ export function buildDistanceMatrix(
         roadLegs += 1;
       } else {
         meters[i][j] = straight;
-        seconds[i][j] = straight / 15.65; // ~35 mph
+        seconds[i][j] = straight / STRAIGHT_LINE_MPS;
       }
     }
   }
