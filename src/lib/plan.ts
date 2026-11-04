@@ -32,7 +32,20 @@ export type RunPlanOptions = {
   batchSize?: number;
   cache?: Map<string, Place | null>;
   yieldFn?: () => Promise<void>;
+  signal?: AbortSignal;
 };
+
+export function isAbortError(error: unknown): boolean {
+  return (
+    (error instanceof DOMException && error.name === "AbortError") ||
+    (error instanceof Error && error.name === "AbortError")
+  );
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  throw new DOMException("Stopped", "AbortError");
+}
 
 export function tooManyStopsMessage(limit = MAX_PLAN_STOPS): string {
   return `Lists are limited to ${limit.toLocaleString()} addresses. Remove some stops or split the list.`;
@@ -122,9 +135,12 @@ export async function runPlan(
   const batchSize = options.batchSize ?? GEOCODE_BATCH_SIZE;
   const cache = options.cache ?? new Map<string, Place | null>();
   const yieldFn = options.yieldFn ?? (async () => undefined);
+  const signal = options.signal;
 
+  throwIfAborted(signal);
   notify({ phase: "geocode", done: 0, total: stops.length });
   const start = await deps.resolveStart(input.start);
+  throwIfAborted(signal);
   const region = regionHintFromPlace(start);
   const bias = { lat: start.lat, lng: start.lng };
 
@@ -147,6 +163,7 @@ export async function runPlan(
   notify({ phase: "geocode", done, total: stops.length });
 
   for (const batch of chunkItems(pending, batchSize)) {
+    throwIfAborted(signal);
     const unique: string[] = [];
     const seen = new Set<string>();
     for (const query of batch) {
@@ -184,6 +201,7 @@ export async function runPlan(
   }
 
   if (located.length <= ROAD_REFINE_MAX_STOPS && deps.refineRoad) {
+    throwIfAborted(signal);
     notify({ phase: "road", done, total: stops.length });
     await yieldFn();
     try {
@@ -194,6 +212,7 @@ export async function runPlan(
     }
   }
 
+  throwIfAborted(signal);
   notify({ phase: "order", done, total: stops.length });
   await yieldFn();
   return { ...assembleStraightPlan(start, orderNearestByHaversine(start, located)), failures };

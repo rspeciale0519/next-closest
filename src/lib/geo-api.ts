@@ -3,14 +3,20 @@ import { z } from "zod";
 import {
   buildDistanceMatrix,
   haversineMeters,
+  normalizeGeocodeKey,
   orderNearestNext,
   type LatLng,
   type Place,
 } from "./geo";
-import { GEOCODE_CONCURRENCY, ROAD_POLYLINE_MAX_STOPS } from "./plan-limits.ts";
+import { fetchJson, mapPool } from "./geo-http.ts";
+import { geocodeWithCache } from "./geocode-cache.ts";
+import {
+  GEOCODE_CONCURRENCY,
+  LIST_GEOCODE_ATTEMPTS,
+  LIST_GEOCODE_TIMEOUT_MS,
+  ROAD_POLYLINE_MAX_STOPS,
+} from "./plan-limits.ts";
 import type { GeocodedStop, OrderedStop, PlanFailure, PlanResult } from "./plan-types.ts";
-
-const UA = "NextClosest/1.0 (stop sequencer; https://grok.com)";
 
 const latLngSchema = z.object({
   lat: z.number().gte(-90).lte(90),
@@ -35,16 +41,6 @@ const placeSchema = z.object({
   lng: z.number().gte(-180).lte(180),
   label: z.string().trim().min(1).max(300),
   query: z.string().trim().min(1).max(300),
-});
-
-/**
- * Small-list path (≤25 stops). The original `.max(25)` stays here so one
- * serverless call still geocodes, asks OSRM for a table, and draws the road
- * line. Larger lists are planned on the client via `geocodeStops` batches.
- */
-const planInput = z.object({
-  start: startInput,
-  stops: z.array(z.string().trim().min(1).max(300)).min(1).max(25),
 });
 
 const geocodeBatchInput = z.object({
@@ -77,21 +73,19 @@ type PhotonFeature = {
   };
 };
 
-type NominatimHit = {
-  lat: string;
-  lon: string;
-  display_name?: string;
-};
-
 export const suggestPlaces = createServerFn({ method: "POST" })
   .validator((data) => suggestInput.parse(data))
   .handler(async ({ data }): Promise<Suggestion[]> => {
+    const { enforcePlanLimit } = await import("./rate-limit.server.ts");
+    await enforcePlanLimit({ kind: "interactive" });
     return photonSuggest(data.query, data.bias);
   });
 
 export const reverseGeocode = createServerFn({ method: "POST" })
   .validator((data) => reverseInput.parse(data))
   .handler(async ({ data }): Promise<Place> => {
+    const { enforcePlanLimit } = await import("./rate-limit.server.ts");
+    await enforcePlanLimit({ kind: "interactive" });
     const nearest = await placeForCoords(data);
     if (nearest) return nearest;
     return {
@@ -105,26 +99,38 @@ export const reverseGeocode = createServerFn({ method: "POST" })
 export const resolveStartPlace = createServerFn({ method: "POST" })
   .validator((data) => startInput.parse(data))
   .handler(async ({ data }): Promise<Place> => {
+    const { enforcePlanLimit } = await import("./rate-limit.server.ts");
+    await enforcePlanLimit({ kind: "interactive", addresses: data.coords ? 0 : 1 });
     return resolveStart(data);
   });
 
 export const geocodeStops = createServerFn({ method: "POST" })
   .validator((data) => geocodeBatchInput.parse(data))
   .handler(async ({ data }): Promise<GeocodedStop[]> => {
+    const { enforcePlanLimit } = await import("./rate-limit.server.ts");
+    const { getGeocodeCache } = await import("./geocode-cache.server.ts");
+    const cache = getGeocodeCache();
     const unique: string[] = [];
     const firstIndex = new Map<string, number>();
-    data.queries.forEach((query, index) => {
-      const key = query.trim().toLowerCase().replace(/\s+/g, " ");
+    data.queries.forEach((query) => {
+      const key = normalizeGeocodeKey(query);
       if (!firstIndex.has(key)) {
         firstIndex.set(key, unique.length);
         unique.push(query);
       }
     });
+
+    const pending: string[] = [];
+    for (const query of unique) {
+      if ((await cache.get(query)) === undefined) pending.push(query);
+    }
+    await enforcePlanLimit({ kind: "geocode", addresses: pending.length });
+
     const found = await mapPool(unique, GEOCODE_CONCURRENCY, (query) =>
-      geocodeOne(query, data.bias, data.region ?? ""),
+      geocodeWithCache(query, cache, (next) => geocodeListOne(next, data.bias)),
     );
     return data.queries.map((query) => {
-      const key = query.trim().toLowerCase().replace(/\s+/g, " ");
+      const key = normalizeGeocodeKey(query);
       const place = found[firstIndex.get(key) ?? 0] ?? null;
       return { query, place };
     });
@@ -133,41 +139,9 @@ export const geocodeStops = createServerFn({ method: "POST" })
 export const refineRoadOrder = createServerFn({ method: "POST" })
   .validator((data) => refineInput.parse(data))
   .handler(async ({ data }): Promise<PlanResult> => {
+    const { enforcePlanLimit } = await import("./rate-limit.server.ts");
+    await enforcePlanLimit({ kind: "interactive" });
     return orderWithOptionalRoad(data.start, data.stops);
-  });
-
-export const planRoute = createServerFn({ method: "POST" })
-  .validator((data) => planInput.parse(data))
-  .handler(async ({ data }): Promise<PlanResult> => {
-    const start = await resolveStart(data.start);
-    const region = regionFromPlace(start);
-    const located = await Promise.all(
-      data.stops.map(async (query) => ({
-        query,
-        place: await geocodeOne(query, start, region),
-      })),
-    );
-    const failures: PlanFailure[] = [];
-    const stops: Place[] = [];
-    for (const item of located) {
-      if (item.place) stops.push(item.place);
-      else failures.push({ query: item.query, message: "Could not find this address" });
-    }
-
-    if (stops.length === 0) {
-      return {
-        start,
-        ordered: [],
-        failures,
-        polyline: [],
-        totalMeters: 0,
-        totalSeconds: 0,
-        source: "straight",
-      };
-    }
-
-    const planned = await orderWithOptionalRoad(start, stops);
-    return { ...planned, failures };
   });
 
 async function orderWithOptionalRoad(start: Place, stops: Place[]): Promise<PlanResult> {
@@ -230,37 +204,25 @@ async function resolveStart(start: z.infer<typeof startInput>): Promise<Place> {
       label: start.query,
     };
   }
-  const found = await geocodeOne(start.query);
+  const found = await geocodeListOne(start.query);
   if (!found) {
     throw new Error(`Could not find starting address: ${start.query}`);
   }
   return found;
 }
 
-async function geocodeOne(query: string, bias?: LatLng, region = ""): Promise<Place | null> {
-  const variants = addressVariants(query, region);
-  for (const candidate of variants) {
-    const census = await censusGeocode(candidate);
-    if (census) return { ...census, query };
-  }
-  for (const candidate of variants) {
-    const arcgis = await arcgisGeocode(candidate, bias);
-    if (arcgis) return { ...arcgis, query };
-  }
-  for (const candidate of variants) {
-    const photon = await photonSearch(candidate, bias);
-    if (photon) return { ...photon, query };
-  }
-  for (const candidate of variants) {
-    const nominatim = await nominatimSearch(candidate, bias);
-    if (nominatim) return { ...nominatim, query };
-  }
-  return null;
-}
-
-async function photonSearch(query: string, bias?: LatLng): Promise<Place | null> {
-  const hits = await photonSuggest(query, bias, 5);
-  return pickMatchingPlace(query, hits, bias);
+/** List + start geocode: Census, then ArcGIS. No Photon/Nominatim, no variant fan-out. */
+async function geocodeListOne(query: string, bias?: LatLng): Promise<Place | null> {
+  const census = await censusGeocode(query, {
+    timeoutMs: LIST_GEOCODE_TIMEOUT_MS,
+    attempts: LIST_GEOCODE_ATTEMPTS,
+  });
+  if (census) return { ...census, query };
+  const arcgis = await arcgisGeocode(query, bias, {
+    timeoutMs: LIST_GEOCODE_TIMEOUT_MS,
+    attempts: LIST_GEOCODE_ATTEMPTS,
+  });
+  return arcgis ? { ...arcgis, query } : null;
 }
 
 async function photonSuggest(query: string, bias?: LatLng, limit = 6): Promise<Place[]> {
@@ -404,33 +366,6 @@ async function photonReverse(coords: LatLng): Promise<Place | null> {
   }
 }
 
-async function nominatimSearch(query: string, bias?: LatLng): Promise<Place | null> {
-  const url = new URL("https://nominatim.openstreetmap.org/search");
-  url.searchParams.set("q", query);
-  url.searchParams.set("format", "jsonv2");
-  url.searchParams.set("limit", "5");
-  url.searchParams.set("addressdetails", "0");
-  url.searchParams.set("countrycodes", "us");
-  try {
-    const hits = await fetchJson<NominatimHit[]>(url.toString());
-    const places: Place[] = [];
-    for (const hit of hits) {
-      const lat = Number(hit.lat);
-      const lng = Number(hit.lon);
-      if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
-      places.push({
-        lat,
-        lng,
-        query,
-        label: hit.display_name || query,
-      });
-    }
-    return pickMatchingPlace(query, places, bias);
-  } catch {
-    return null;
-  }
-}
-
 type ArcgisResponse = {
   candidates?: Array<{
     address?: string;
@@ -440,7 +375,11 @@ type ArcgisResponse = {
   }>;
 };
 
-async function arcgisGeocode(query: string, bias?: LatLng): Promise<Place | null> {
+async function arcgisGeocode(
+  query: string,
+  bias?: LatLng,
+  fetchOpts?: { timeoutMs?: number; attempts?: number },
+): Promise<Place | null> {
   const url = new URL("https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates");
   url.searchParams.set("f", "json");
   url.searchParams.set("singleLine", query);
@@ -449,7 +388,10 @@ async function arcgisGeocode(query: string, bias?: LatLng): Promise<Place | null
   url.searchParams.set("countryCode", "USA");
   if (bias) url.searchParams.set("location", `${bias.lng},${bias.lat}`);
   try {
-    const json = await fetchJson<ArcgisResponse>(url.toString(), undefined, 12000);
+    const json = await fetchJson<ArcgisResponse>(url.toString(), undefined, {
+      timeoutMs: fetchOpts?.timeoutMs ?? 12000,
+      attempts: fetchOpts?.attempts,
+    });
     const places: Place[] = [];
     for (const hit of json.candidates ?? []) {
       const lat = hit.location?.y;
@@ -493,13 +435,19 @@ type CensusResponse = {
   };
 };
 
-async function censusGeocode(query: string): Promise<Place | null> {
+async function censusGeocode(
+  query: string,
+  fetchOpts?: { timeoutMs?: number; attempts?: number },
+): Promise<Place | null> {
   const url = new URL("https://geocoding.geo.census.gov/geocoder/locations/onelineaddress");
   url.searchParams.set("address", query);
   url.searchParams.set("benchmark", "Public_AR_Current");
   url.searchParams.set("format", "json");
   try {
-    const json = await fetchJson<CensusResponse>(url.toString(), undefined, 12000);
+    const json = await fetchJson<CensusResponse>(url.toString(), undefined, {
+      timeoutMs: fetchOpts?.timeoutMs ?? 12000,
+      attempts: fetchOpts?.attempts,
+    });
     const match = json.result?.addressMatches?.[0];
     const lng = match?.coordinates?.x;
     const lat = match?.coordinates?.y;
@@ -566,94 +514,6 @@ function streetKey(value: string): string {
 
 function haversineMiles(a: LatLng, b: LatLng): number {
   return haversineMeters(a, b) / 1609.344;
-}
-
-function regionFromPlace(place: Place): string {
-  const text = place.label || place.query;
-  const parts = text
-    .split(",")
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .slice(1)
-    .filter((part) => !/^(usa|united states|us)$/i.test(part))
-    .filter((part) => !/^\d{5}(?:-\d{4})?$/.test(part));
-  return parts.join(", ");
-}
-
-function addressVariants(query: string, region: string): string[] {
-  const cleaned = query
-    .replace(/\s+/g, " ")
-    .replace(/\b(apt|apartment|unit|ste|suite|#)\s*[a-z0-9-]+\b/gi, "")
-    .replace(/[.,\s]+$/g, "")
-    .replace(/,\s*,/g, ",")
-    .trim();
-  const withRegion = applyRegion(cleaned, region);
-  const out: string[] = [];
-  for (const value of [cleaned, withRegion, expandSuffixes(cleaned), expandSuffixes(withRegion), collapseSuffixes(cleaned), collapseSuffixes(withRegion)]) {
-    if (value && !out.some((item) => item.toLowerCase() === value.toLowerCase())) out.push(value);
-  }
-  return out;
-}
-
-function applyRegion(query: string, region: string): string {
-  if (!region) return query;
-  const missing = region
-    .split(",")
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .filter((part) => !query.toLowerCase().includes(part.toLowerCase()));
-  if (missing.length === 0) return query;
-  return `${query}, ${missing.join(", ")}`;
-}
-
-const LONG_SUFFIX: Array<[RegExp, string]> = [
-  [/\bstreets?\b/gi, "St"],
-  [/\bdrives?\b/gi, "Dr"],
-  [/\bavenues?\b/gi, "Ave"],
-  [/\broads?\b/gi, "Rd"],
-  [/\blanes?\b/gi, "Ln"],
-  [/\bcourts?\b/gi, "Ct"],
-  [/\bboulevards?\b/gi, "Blvd"],
-  [/\bcircles?\b/gi, "Cir"],
-  [/\bplaces?\b/gi, "Pl"],
-  [/\bterraces?\b/gi, "Ter"],
-  [/\btrails?\b/gi, "Trl"],
-  [/\bparkways?\b/gi, "Pkwy"],
-  [/\bhighways?\b/gi, "Hwy"],
-];
-
-const SHORT_SUFFIX: Array<[RegExp, string]> = [
-  [/\bst\b/gi, "Street"],
-  [/\bdr\b/gi, "Drive"],
-  [/\bave\b/gi, "Avenue"],
-  [/\brd\b/gi, "Road"],
-  [/\bln\b/gi, "Lane"],
-  [/\bct\b/gi, "Court"],
-  [/\bblvd\b/gi, "Boulevard"],
-  [/\bcir\b/gi, "Circle"],
-  [/\bpl\b/gi, "Place"],
-  [/\bter\b/gi, "Terrace"],
-  [/\btrl\b/gi, "Trail"],
-  [/\bpkwy\b/gi, "Parkway"],
-  [/\bhwy\b/gi, "Highway"],
-];
-
-function expandSuffixes(value: string): string {
-  return transformStreet(value, (street) =>
-    SHORT_SUFFIX.reduce((text, [pattern, repl]) => text.replace(pattern, repl), street),
-  );
-}
-
-function collapseSuffixes(value: string): string {
-  return transformStreet(value, (street) =>
-    LONG_SUFFIX.reduce((text, [pattern, repl]) => text.replace(pattern, repl), street),
-  );
-}
-
-function transformStreet(value: string, fn: (street: string) => string): string {
-  const comma = value.indexOf(",");
-  if (comma === -1) return fn(value);
-  return `${fn(value.slice(0, comma))}${value.slice(comma)}`;
 }
 
 function titleCaseAddress(value: string): string {
@@ -854,73 +714,4 @@ function formatPhoton(
   if (props.state) bits.push(props.state);
   const label = bits.join(", ");
   return label || fallback;
-}
-
-async function mapPool<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const out = new Array<R>(items.length);
-  let next = 0;
-  async function worker() {
-    while (next < items.length) {
-      const index = next;
-      next += 1;
-      out[index] = await fn(items[index], index);
-    }
-  }
-  const workers = Math.min(Math.max(1, limit), items.length);
-  await Promise.all(Array.from({ length: workers }, () => worker()));
-  return out;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function fetchJson<T>(url: string, init?: RequestInit, timeoutMs = 10000): Promise<T> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    try {
-      const res = await fetch(url, {
-        ...init,
-        signal: ctrl.signal,
-        headers: {
-          Accept: "application/json",
-          "User-Agent": UA,
-          ...(init?.headers ?? {}),
-        },
-      });
-      if (res.status === 429 || res.status >= 500) {
-        lastError = new Error(`HTTP ${res.status}`);
-        if (attempt < 3) {
-          const retryAfter = Number(res.headers.get("retry-after"));
-          const wait =
-            Number.isFinite(retryAfter) && retryAfter > 0
-              ? Math.min(retryAfter * 1000, 8000)
-              : Math.min(400 * 2 ** attempt, 4000);
-          await sleep(wait);
-          continue;
-        }
-        throw lastError;
-      }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return (await res.json()) as T;
-    } catch (err) {
-      lastError = err;
-      const retryable =
-        (err instanceof Error && err.name === "AbortError") || err instanceof TypeError;
-      if (attempt < 3 && retryable) {
-        await sleep(Math.min(400 * 2 ** attempt, 4000));
-        continue;
-      }
-      throw err;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-  throw lastError;
 }

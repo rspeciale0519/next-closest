@@ -217,6 +217,29 @@ describe("runPlan", () => {
     assert.equal(planProgressView(sorting).percent, planProgressView(lastLocate).percent);
   });
 
+  it("stops between batches when the abort signal fires", async () => {
+    const stops = Array.from({ length: 40 }, (_, i) => `Stop ${i}`);
+    const ctrl = new AbortController();
+    let geocodeCalls = 0;
+    await assert.rejects(
+      () =>
+        runPlan(
+          { start: { query: startPlace.query }, stops },
+          {
+            resolveStart: async () => startPlace,
+            geocodeBatch: async ({ queries }) => {
+              geocodeCalls += 1;
+              if (geocodeCalls === 1) ctrl.abort();
+              return queries.map((query, i) => ({ query, place: placeFor(query, i) }));
+            },
+          },
+          { signal: ctrl.signal },
+        ),
+      (err: unknown) => err instanceof Error && err.name === "AbortError",
+    );
+    assert.equal(geocodeCalls, 1);
+  });
+
   it("rejects more than 2,500 stops before any geocoding", async () => {
     const stops = Array.from({ length: MAX_PLAN_STOPS + 1 }, (_, i) => `Stop ${i}`);
     let resolveCalls = 0;

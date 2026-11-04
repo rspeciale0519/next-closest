@@ -30,6 +30,7 @@ import { fileToImageDataUrl } from "@/lib/image-file";
 import { formatDuration, formatMiles, parseAddressList, type Place } from "@/lib/geo";
 import {
   formatPlanProgress,
+  isAbortError,
   MAX_PLAN_STOPS,
   runPlan,
   tooManyStopsMessage,
@@ -59,6 +60,8 @@ export function Planner() {
   const suggestTimer = useRef<number | null>(null);
   const startBoxRef = useRef<HTMLDivElement>(null);
   const photoInputRef = useRef<HTMLInputElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const aliveRef = useRef(true);
 
   const stopCount = parseAddressList(stopsText).length;
   const overLimit = stopCount > MAX_PLAN_STOPS;
@@ -73,6 +76,7 @@ export function Planner() {
       setStopsText(stored.stopsText);
     }
     setHydrated(true);
+    if (!import.meta.env.DEV) return;
     const raw = new URLSearchParams(window.location.search).get("progressPreview");
     if (!raw) return;
     const [doneRaw, totalRaw, phaseRaw] = raw.split("/");
@@ -81,6 +85,14 @@ export function Planner() {
     if (!Number.isFinite(done) || !Number.isFinite(total) || total <= 0) return;
     const phase = phaseRaw === "order" || phaseRaw === "road" ? phaseRaw : "geocode";
     setPreviewProgress({ phase, done, total });
+  }, []);
+
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+      abortRef.current?.abort();
+    };
   }, []);
 
   useEffect(() => {
@@ -256,6 +268,10 @@ export function Planner() {
     }
   }
 
+  function stopPlan() {
+    abortRef.current?.abort();
+  }
+
   async function onPlan() {
     const stops = parseAddressList(stopsText);
     if (!startQuery.trim() || stops.length === 0) return;
@@ -263,6 +279,10 @@ export function Planner() {
       setError(tooManyStopsMessage());
       return;
     }
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    const signal = ctrl.signal;
     setPlanning(true);
     setProgress({ phase: "geocode", done: 0, total: stops.length });
     setError(null);
@@ -275,13 +295,15 @@ export function Planner() {
       const result = await runPlan(
         { start, stops },
         {
-          resolveStart: (value) => resolveStartPlace({ data: value }),
-          geocodeBatch: (data) => geocodeStops({ data }),
+          resolveStart: (value) => resolveStartPlace({ data: value, signal }),
+          geocodeBatch: (data) => geocodeStops({ data, signal }),
           refineRoad: (origin, located) =>
-            refineRoadOrder({ data: { start: origin, stops: located } }),
+            refineRoadOrder({ data: { start: origin, stops: located }, signal }),
         },
         {
+          signal,
           onProgress: (next) => {
+            if (!aliveRef.current || signal.aborted) return;
             setProgress((prev) => {
               if (!prev) return next;
               return next.done < prev.done ? { ...next, done: prev.done } : next;
@@ -290,14 +312,18 @@ export function Planner() {
           yieldFn: () => new Promise((resolve) => window.setTimeout(resolve, 0)),
         },
       );
+      if (!aliveRef.current || signal.aborted) return;
       setPlan(result);
       if (result.ordered.length === 0) {
         setError("None of those addresses could be found. Check spelling and try again.");
       }
     } catch (err) {
+      if (!aliveRef.current || signal.aborted || isAbortError(err)) return;
       setPlan(null);
       setError(err instanceof Error ? err.message : "Could not order those stops.");
     } finally {
+      if (abortRef.current === ctrl) abortRef.current = null;
+      if (!aliveRef.current) return;
       setPlanning(false);
       setProgress(null);
     }
@@ -488,16 +514,22 @@ export function Planner() {
             <PlanProgressBar progress={barProgress} className="rounded-xl bg-surface p-4 shadow-border" />
           ) : null}
 
-          <Button size="lg" className="w-full" disabled={!canPlan} onClick={() => void onPlan()}>
-            {planning ? (
-              <>
+          {planning ? (
+            <div className="flex flex-col gap-2">
+              <Button size="lg" className="w-full" disabled>
                 <LoaderCircle className="size-4 animate-spin" />
                 {progress ? formatPlanProgress(progress) : "Ordering stops"}
-              </>
-            ) : (
-              "Order by next closest"
-            )}
-          </Button>
+              </Button>
+              <Button size="lg" variant="secondary" className="w-full" onClick={stopPlan}>
+                <X className="size-4" />
+                Stop
+              </Button>
+            </div>
+          ) : (
+            <Button size="lg" className="w-full" disabled={!canPlan} onClick={() => void onPlan()}>
+              Order by next closest
+            </Button>
+          )}
 
           {plan && plan.ordered.length > 0 ? (
             <Results plan={plan} onCopy={() => void copyList()} navPlaces={navPlaces} />
