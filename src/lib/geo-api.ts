@@ -15,6 +15,7 @@ import {
   LIST_GEOCODE_TIMEOUT_MS,
   ROAD_REFINE_MAX_STOPS,
 } from "./plan-limits.ts";
+import { isLimitClosedError, rethrowLimitError } from "./rate-limit.ts";
 import type { GeocodedStop, OrderedStop, PlanFailure, PlanResult } from "./plan-types.ts";
 
 const latLngSchema = z.object({
@@ -72,19 +73,28 @@ type PhotonFeature = {
   };
 };
 
+async function requirePlanLimit(
+  opts: { kind?: "interactive" | "geocode"; addresses?: number } = {},
+): Promise<void> {
+  try {
+    const { enforcePlanLimit } = await import("./rate-limit.server.ts");
+    await enforcePlanLimit(opts);
+  } catch (err) {
+    rethrowLimitError(err);
+  }
+}
+
 export const suggestPlaces = createServerFn({ method: "POST" })
   .validator((data) => suggestInput.parse(data))
   .handler(async ({ data }): Promise<Suggestion[]> => {
-    const { enforcePlanLimit } = await import("./rate-limit.server.ts");
-    await enforcePlanLimit({ kind: "interactive" });
+    await requirePlanLimit({ kind: "interactive" });
     return photonSuggest(data.query, data.bias);
   });
 
 export const reverseGeocode = createServerFn({ method: "POST" })
   .validator((data) => reverseInput.parse(data))
   .handler(async ({ data }): Promise<Place> => {
-    const { enforcePlanLimit } = await import("./rate-limit.server.ts");
-    await enforcePlanLimit({ kind: "interactive" });
+    await requirePlanLimit({ kind: "interactive" });
     const nearest = await placeForCoords(data);
     if (nearest) return nearest;
     return {
@@ -98,15 +108,14 @@ export const reverseGeocode = createServerFn({ method: "POST" })
 export const resolveStartPlace = createServerFn({ method: "POST" })
   .validator((data) => startInput.parse(data))
   .handler(async ({ data }): Promise<Place> => {
-    const { enforcePlanLimit } = await import("./rate-limit.server.ts");
-    await enforcePlanLimit({ kind: "interactive", addresses: data.coords ? 0 : 1 });
+    await requirePlanLimit({ kind: "interactive", addresses: data.coords ? 0 : 1 });
     return resolveStart(data);
   });
 
 export const geocodeStops = createServerFn({ method: "POST" })
   .validator((data) => geocodeBatchInput.parse(data))
   .handler(async ({ data }): Promise<GeocodedStop[]> => {
-    const { enforcePlanLimit } = await import("./rate-limit.server.ts");
+    const { enforceGeocodeBudget } = await import("./rate-limit.server.ts");
     const { getGeocodeCache } = await import("./geocode-cache.server.ts");
     const cache = getGeocodeCache();
     const unique: string[] = [];
@@ -123,7 +132,11 @@ export const geocodeStops = createServerFn({ method: "POST" })
     for (const query of unique) {
       if ((await cache.get(query)) === undefined) pending.push(query);
     }
-    await enforcePlanLimit({ kind: "geocode", addresses: pending.length });
+    try {
+      await enforceGeocodeBudget(pending.length);
+    } catch (err) {
+      rethrowLimitError(err);
+    }
 
     const found = await mapPool(unique, GEOCODE_CONCURRENCY, (query) =>
       geocodeWithCache(query, cache, (next) => geocodeListOne(next, data.bias)),
@@ -138,8 +151,12 @@ export const geocodeStops = createServerFn({ method: "POST" })
 export const refineRoadOrder = createServerFn({ method: "POST" })
   .validator((data) => refineInput.parse(data))
   .handler(async ({ data }): Promise<PlanResult | null> => {
-    const { enforcePlanLimit } = await import("./rate-limit.server.ts");
-    await enforcePlanLimit({ kind: "interactive" });
+    try {
+      await requirePlanLimit({ kind: "interactive" });
+    } catch (err) {
+      if (isLimitClosedError(err)) return null;
+      throw err;
+    }
     const { lookupOsrmTable } = await import("./osrm.server.ts");
     const table = await lookupOsrmTable([data.start, ...data.stops]);
     if (!table) return null;
@@ -335,11 +352,21 @@ type ArcgisResponse = {
   }>;
 };
 
+async function takeSharedGeocodeSlot(): Promise<void> {
+  try {
+    const { consumeSharedGeocodeSlot } = await import("./rate-limit.server.ts");
+    await consumeSharedGeocodeSlot();
+  } catch (err) {
+    rethrowLimitError(err);
+  }
+}
+
 async function arcgisGeocode(
   query: string,
   bias?: LatLng,
   fetchOpts?: { timeoutMs?: number; attempts?: number },
 ): Promise<Place | null> {
+  await takeSharedGeocodeSlot();
   const url = new URL("https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates");
   url.searchParams.set("f", "json");
   url.searchParams.set("singleLine", query);
@@ -381,7 +408,8 @@ async function arcgisGeocode(
       query,
       label: titleCaseAddress(top.attributes?.Match_addr || top.address || query),
     };
-  } catch {
+  } catch (err) {
+    if (isLimitClosedError(err)) throw err;
     return null;
   }
 }
@@ -399,6 +427,7 @@ async function censusGeocode(
   query: string,
   fetchOpts?: { timeoutMs?: number; attempts?: number },
 ): Promise<Place | null> {
+  await takeSharedGeocodeSlot();
   const url = new URL("https://geocoding.geo.census.gov/geocoder/locations/onelineaddress");
   url.searchParams.set("address", query);
   url.searchParams.set("benchmark", "Public_AR_Current");
@@ -418,7 +447,8 @@ async function censusGeocode(
       query,
       label: titleCaseAddress(match.matchedAddress || query),
     };
-  } catch {
+  } catch (err) {
+    if (isLimitClosedError(err)) throw err;
     return null;
   }
 }

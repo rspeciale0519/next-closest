@@ -52,5 +52,14 @@ export const OSRM_TIMEOUT_MS = 8000;
 export const OSRM_GLOBAL_INTERVAL_MS = 2000;
 export const OSRM_SLOT_WAIT_MS = 4000;
 
+/**
+ * Shared Census/ArcGIS cap: 10 upstream HTTP calls / second across instances.
+ * A 2,500-stop list (Census hits) is 2,500 calls ≈ 250s at the cap. Cache hits
+ * do not consume a slot. If the slot is busy, wait up to this budget then
+ * reject the lookup (production also fails closed when Redis is down).
+ */
+export const GEOCODE_UPSTREAM_INTERVAL_MS = 1000;
+export const GEOCODE_SLOT_WAIT_MS = 4000;
+
 export const STRAIGHT_LINE_FALLBACK_NOTE =
   "Ordered by straight-line distance (driving times unavailable).";

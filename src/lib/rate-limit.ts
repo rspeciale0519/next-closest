@@ -1,29 +1,44 @@
-import { OSRM_GLOBAL_INTERVAL_MS, OSRM_SLOT_WAIT_MS } from "./plan-limits.ts";
+import {
+  GEOCODE_SLOT_WAIT_MS,
+  OSRM_GLOBAL_INTERVAL_MS,
+  OSRM_SLOT_WAIT_MS,
+} from "./plan-limits.ts";
 
 /** Per-IP burst cap for typeahead, reverse, start, and road refine. */
 export const RATE_LIMIT_REQUESTS_PER_MINUTE = 10;
 
 /**
- * List geocode is one HTTP call per 20 addresses. A 1,312-stop job is 66
- * batches; a 2,500-stop job is 125. 10 req/min would stall that mid-list, so
- * batches use this separate cap (enough for one full list in a couple of minutes).
+ * List geocode is one RPC per 20 addresses. A 2,500-stop job is 125 batches.
+ * The same 10 req/min interactive cap would reject that job after 200 addresses,
+ * so list batches use this separate per-IP cap (one full list per minute).
  */
-export const RATE_LIMIT_GEOCODE_BATCHES_PER_MINUTE = 80;
+export const RATE_LIMIT_GEOCODE_BATCHES_PER_MINUTE = 125;
 
 /**
- * Hourly unique-lookup budget. Review asked for “a few hundred”; that rejects
- * the owner’s 1,312-stop spreadsheet, so this is one full list (the hard cap).
+ * Per-IP uncached address budget. “A few hundred / hour” would reject a
+ * 2,500-stop list on the first Order. This is one full list (the hard cap).
  * Cache hits do not consume this.
  */
 export const RATE_LIMIT_ADDRESSES_PER_HOUR = 2500;
 
+/**
+ * Shared cross-instance Census/ArcGIS cap. 10 upstream HTTP calls / second
+ * lets a 2,500-stop list finish (2,500 Census hits ≈ 250s at the cap; typical
+ * concurrency finishes faster). Cache hits do not consume a slot.
+ */
+export const RATE_LIMIT_GEOCODE_UPSTREAM_PER_SECOND = 10;
+export const RATE_LIMIT_GEOCODE_UPSTREAM_WINDOW_MS = 1000;
+
 /** One public OSRM table call per 2s, shared across instances. */
 export const RATE_LIMIT_OSRM_PER_WINDOW = 1;
-export { OSRM_GLOBAL_INTERVAL_MS as RATE_LIMIT_OSRM_WINDOW_MS, OSRM_SLOT_WAIT_MS };
+export { OSRM_GLOBAL_INTERVAL_MS as RATE_LIMIT_OSRM_WINDOW_MS, OSRM_SLOT_WAIT_MS, GEOCODE_SLOT_WAIT_MS };
+
+export const LOOKUP_LIMIT_UNAVAILABLE =
+  "Lookup limit service unavailable, try again shortly";
 
 export type ConsumeResult =
   | { ok: true }
-  | { ok: false; retryAfterSec: number };
+  | { ok: false; retryAfterSec: number; unavailable?: boolean };
 
 export type RateLimiter = {
   consume(bucket: string, cost?: number): Promise<ConsumeResult>;
@@ -36,6 +51,52 @@ export class RateLimitError extends Error {
     this.name = "RateLimitError";
     this.retryAfterSec = retryAfterSec;
   }
+}
+
+export class LimitServiceUnavailableError extends Error {
+  readonly status = 503;
+  constructor(message = LOOKUP_LIMIT_UNAVAILABLE) {
+    super(message);
+    this.name = "LimitServiceUnavailableError";
+  }
+}
+
+export function limitFailClosedFromEnv(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return env.NODE_ENV === "production" || env.VERCEL === "1";
+}
+
+export function closedLimiter(): RateLimiter {
+  return {
+    async consume() {
+      return { ok: false, retryAfterSec: 30, unavailable: true };
+    },
+  };
+}
+
+/**
+ * Redis when configured. Production (or Vercel) with missing/erroring Redis
+ * fails closed. In-memory fallback is only for local dev and tests.
+ */
+export function resolveLimiter(
+  redis: RateLimiter | null,
+  memory: RateLimiter,
+  failClosed: boolean,
+): RateLimiter {
+  if (!redis) {
+    return failClosed ? closedLimiter() : memory;
+  }
+  return {
+    async consume(bucket, cost = 1) {
+      try {
+        return await redis.consume(bucket, cost);
+      } catch {
+        if (failClosed) return { ok: false, retryAfterSec: 30, unavailable: true };
+        return memory.consume(bucket, cost);
+      }
+    },
+  };
 }
 
 export function createMemoryLimiter(limit: number, windowMs: number): RateLimiter {
@@ -79,6 +140,7 @@ export async function waitForOsrmSlot(
     }
     const result = await consume();
     if (result.ok) return true;
+    if (result.unavailable) return false;
     const remaining = maxWaitMs - (now() - started);
     if (remaining <= 0) return false;
     const waitMs = Math.min(remaining, Math.max(1, result.retryAfterSec) * 1000);
@@ -91,4 +153,26 @@ export function clientIpFromHeaders(headers: Headers): string {
   const vercel = headers.get("x-vercel-forwarded-for")?.split(",")[0]?.trim();
   const real = headers.get("x-real-ip")?.trim();
   return forwarded || vercel || real || "local";
+}
+
+export function limitUnavailableResponse(): Response {
+  return new Response(LOOKUP_LIMIT_UNAVAILABLE, {
+    status: 503,
+    statusText: "Service Unavailable",
+    headers: { "content-type": "text/plain; charset=utf-8" },
+  });
+}
+
+export function rethrowLimitError(err: unknown): never {
+  if (err instanceof LimitServiceUnavailableError) {
+    throw limitUnavailableResponse();
+  }
+  throw err;
+}
+
+export function isLimitClosedError(err: unknown): boolean {
+  return (
+    err instanceof LimitServiceUnavailableError ||
+    (typeof Response !== "undefined" && err instanceof Response && err.status === 503)
+  );
 }

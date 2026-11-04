@@ -1,11 +1,14 @@
 import { Redis } from "@upstash/redis";
+import { limitFailClosedFromEnv } from "./rate-limit.ts";
 
 let warned = false;
 let cached: Redis | null | undefined;
 
-export function readRedisEnv(): { url: string; token: string } | null {
-  const url = (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || "").trim();
-  const token = (process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || "").trim();
+export function readRedisEnv(
+  env: Record<string, string | undefined> = process.env,
+): { url: string; token: string } | null {
+  const url = (env.KV_REST_API_URL || env.UPSTASH_REDIS_REST_URL || "").trim();
+  const token = (env.KV_REST_API_TOKEN || env.UPSTASH_REDIS_REST_TOKEN || "").trim();
   if (!url || !token) return null;
   return { url, token };
 }
@@ -13,8 +16,14 @@ export function readRedisEnv(): { url: string; token: string } | null {
 export function warnMissingRedisOnce(): void {
   if (warned) return;
   warned = true;
+  if (limitFailClosedFromEnv()) {
+    console.warn(
+      "[next-closest] KV_REST_API_URL/TOKEN or UPSTASH_REDIS_REST_URL/TOKEN is unset. Production fails closed: geocoding is unavailable and OSRM is skipped.",
+    );
+    return;
+  }
   console.warn(
-    "[next-closest] KV_REST_API_URL/TOKEN or UPSTASH_REDIS_REST_URL/TOKEN is unset. Using in-memory rate limits and geocode cache; they are not shared across Vercel instances.",
+    "[next-closest] KV_REST_API_URL/TOKEN or UPSTASH_REDIS_REST_URL/TOKEN is unset. Using in-memory rate limits and geocode cache (dev/test only).",
   );
 }
 
