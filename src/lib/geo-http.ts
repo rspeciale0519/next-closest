@@ -1,8 +1,37 @@
 export const GEOCODE_USER_AGENT =
   "nextclosest.vercel.app (+https://github.com/rspeciale0519/next-closest)";
 
-export function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Stopped", "AbortError"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Stopped", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort);
+  });
+}
+
+/** Census timeout falls through to ArcGIS. Stop stays fatal. ArcGIS timeout propagates. */
+export async function geocodeListFallback<T>(
+  census: () => Promise<T | null>,
+  arcgis: () => Promise<T | null>,
+): Promise<T | null> {
+  try {
+    const hit = await census();
+    if (hit) return hit;
+  } catch (err) {
+    if (isStoppedError(err)) throw err;
+    if (!isLookupTimeoutError(err)) throw err;
+  }
+  return arcgis();
 }
 
 export async function mapPool<T, R>(
@@ -30,6 +59,24 @@ export type FetchJsonOptions = {
   attempts?: number;
   signal?: AbortSignal;
 };
+
+export class LookupTimeoutError extends Error {
+  constructor(message = "Lookup timed out") {
+    super(message);
+    this.name = "TimeoutError";
+  }
+}
+
+export function isStoppedError(err: unknown): boolean {
+  return (
+    (err instanceof DOMException && err.name === "AbortError") ||
+    (err instanceof Error && err.name === "AbortError")
+  );
+}
+
+export function isLookupTimeoutError(err: unknown): boolean {
+  return err instanceof LookupTimeoutError || (err instanceof Error && err.name === "TimeoutError");
+}
 
 export function listProviderFetchOpts(
   fetchOpts?: { timeoutMs?: number; attempts?: number },
@@ -87,11 +134,17 @@ export async function fetchJson<T>(
       return (await res.json()) as T;
     } catch (err) {
       lastError = err;
-      if (opts.signal?.aborted || (err instanceof DOMException && err.name === "AbortError" && opts.signal)) {
+      if (opts.signal?.aborted) {
         throw new DOMException("Stopped", "AbortError");
       }
-      const retryable =
-        (err instanceof Error && err.name === "AbortError") || err instanceof TypeError;
+      if (err instanceof Error && err.name === "AbortError") {
+        if (attempt < attempts - 1) {
+          await sleep(Math.min(400 * 2 ** attempt, 4000));
+          continue;
+        }
+        throw new LookupTimeoutError();
+      }
+      const retryable = err instanceof TypeError;
       if (attempt < attempts - 1 && retryable) {
         await sleep(Math.min(400 * 2 ** attempt, 4000));
         continue;

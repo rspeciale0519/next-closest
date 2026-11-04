@@ -214,12 +214,13 @@ export function limitUnavailableResponse(): Response {
 }
 
 export function rateLimitResponse(err: RateLimitError): Response {
-  return new Response(err.message, {
+  const retryAfter = String(Math.max(1, Math.floor(err.retryAfterSec)));
+  return new Response(`${err.message} Retry-After: ${retryAfter}`, {
     status: 429,
     statusText: "Too Many Requests",
     headers: {
       "content-type": "text/plain; charset=utf-8",
-      "Retry-After": String(Math.max(1, Math.floor(err.retryAfterSec))),
+      "Retry-After": retryAfter,
     },
   });
 }

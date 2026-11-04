@@ -9,14 +9,18 @@ import {
   MAX_PLAN_STOPS,
   planProgressView,
   ROAD_REFINE_MAX_STOPS,
+  retryAfterSecFromError,
   runPlan,
   STRAIGHT_LINE_FALLBACK_NOTE,
   tooManyStopsMessage,
   type PlanDeps,
 } from "./plan.ts";
+import { LimitServiceUnavailableError, LOOKUP_LIMIT_UNAVAILABLE, RateLimitError } from "./rate-limit.ts";
 import type { PlanProgress } from "./plan-types.ts";
 import type { Place } from "./geo.ts";
 import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { detectColumns, extractAddresses } from "./spreadsheet.ts";
 import { parseSpreadsheetFile } from "./spreadsheet-file.ts";
 
@@ -42,6 +46,13 @@ describe("plan limits and progress copy", () => {
   it("caps lists at the importer's 2,500-row limit", () => {
     assert.equal(MAX_PLAN_STOPS, 2500);
     assert.match(tooManyStopsMessage(), /2,500/);
+  });
+
+  it("documents Photon typeahead and ArcGIS-only reverse, not Nominatim", () => {
+    const limits = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "plan-limits.ts"), "utf8");
+    assert.match(limits, /Photon stays on typeahead/);
+    assert.match(limits, /Reverse geocoding is ArcGIS only/);
+    assert.doesNotMatch(limits, /Nominatim/);
   });
 
   it("formats locating progress the way the owner asked for", () => {
@@ -285,6 +296,95 @@ describe("runPlan", () => {
       (err: unknown) => err instanceof Error && err.name === "AbortError",
     );
     assert.equal(geocodeCalls, 1);
+  });
+
+  it("waits once for Retry-After and retries a 429 geocode batch", async () => {
+    const waits: number[] = [];
+    let geocodeCalls = 0;
+    const result = await runPlan(
+      { start: { query: startPlace.query }, stops: ["606 TINA LN"] },
+      {
+        resolveStart: async () => startPlace,
+        geocodeBatch: async ({ queries }) => {
+          geocodeCalls += 1;
+          if (geocodeCalls === 1) {
+            throw new RateLimitError("Too many address lookups right now. Try again shortly.", 2);
+          }
+          return queries.map((query) => ({ query, place: placeFor(query, 0) }));
+        },
+      },
+      { sleep: async (ms) => { waits.push(ms); } },
+    );
+    assert.equal(geocodeCalls, 2);
+    assert.deepEqual(waits, [2000]);
+    assert.equal(result.ordered.length, 1);
+    assert.equal(retryAfterSecFromError(new Error("Too many address lookups right now. Try again shortly. Retry-After: 4")), 4);
+  });
+
+  it("does not retry a 503 try-again-shortly error", async () => {
+    let geocodeCalls = 0;
+    await assert.rejects(
+      () =>
+        runPlan(
+          { start: { query: startPlace.query }, stops: ["606 TINA LN"] },
+          {
+            resolveStart: async () => startPlace,
+            geocodeBatch: async () => {
+              geocodeCalls += 1;
+              throw new LimitServiceUnavailableError();
+            },
+          },
+          { sleep: async () => undefined },
+        ),
+      (err: unknown) => err instanceof LimitServiceUnavailableError,
+    );
+    assert.equal(geocodeCalls, 1);
+    assert.equal(retryAfterSecFromError(new LimitServiceUnavailableError()), null);
+    assert.equal(retryAfterSecFromError(new Error(LOOKUP_LIMIT_UNAVAILABLE)), null);
+  });
+
+  it("cuts a 429 retry wait short when Stop fires", async () => {
+    const ctrl = new AbortController();
+    let geocodeCalls = 0;
+    const started = Date.now();
+    const pending = runPlan(
+      { start: { query: startPlace.query }, stops: ["606 TINA LN"] },
+      {
+        resolveStart: async () => startPlace,
+        geocodeBatch: async () => {
+          geocodeCalls += 1;
+          throw new RateLimitError("Too many address lookups right now. Try again shortly.", 60);
+        },
+      },
+      { signal: ctrl.signal },
+    );
+    setTimeout(() => ctrl.abort(), 15);
+    await assert.rejects(
+      () => pending,
+      (err: unknown) => err instanceof Error && err.name === "AbortError",
+    );
+    assert.equal(geocodeCalls, 1);
+    assert.ok(Date.now() - started < 2000);
+  });
+
+  it("does not retry a second 429", async () => {
+    let geocodeCalls = 0;
+    await assert.rejects(
+      () =>
+        runPlan(
+          { start: { query: startPlace.query }, stops: ["606 TINA LN"] },
+          {
+            resolveStart: async () => startPlace,
+            geocodeBatch: async () => {
+              geocodeCalls += 1;
+              throw new RateLimitError("Too many address lookups right now. Try again shortly.", 1);
+            },
+          },
+          { sleep: async () => undefined },
+        ),
+      (err: unknown) => err instanceof RateLimitError,
+    );
+    assert.equal(geocodeCalls, 2);
   });
 
   it("rejects more than 2,500 stops before any geocoding", async () => {

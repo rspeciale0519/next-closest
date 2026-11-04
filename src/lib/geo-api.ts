@@ -6,7 +6,14 @@ import {
   type LatLng,
   type Place,
 } from "./geo";
-import { fetchJson, listProviderFetchOpts, mapPool } from "./geo-http.ts";
+import {
+  fetchJson,
+  geocodeListFallback,
+  isLookupTimeoutError,
+  isStoppedError,
+  listProviderFetchOpts,
+  mapPool,
+} from "./geo-http.ts";
 import { geocodeWithCache } from "./geocode-cache.ts";
 import { planFromOsrmTable } from "./osrm.ts";
 import {
@@ -16,7 +23,7 @@ import {
   ROAD_REFINE_MAX_STOPS,
 } from "./plan-limits.ts";
 import { isLimitClosedError, isLimitResponseError, rethrowLimitError } from "./rate-limit.ts";
-import { REVERSE_GEOCODER, reverseGeocodeUrl } from "./reverse-geocode.ts";
+import { REVERSE_GEOCODER, prepareReverseLookup, reverseGeocodeUrl } from "./reverse-geocode.ts";
 import type { GeocodedStop, OrderedStop, PlanFailure, PlanResult } from "./plan-types.ts";
 
 export { REVERSE_GEOCODER, reverseGeocodeUrl };
@@ -193,16 +200,17 @@ async function resolveStart(start: z.infer<typeof startInput>): Promise<Place> {
 
 /** List + start geocode: Census, then ArcGIS. No Photon/Nominatim, no variant fan-out. */
 async function geocodeListOne(query: string, bias?: LatLng): Promise<Place | null> {
-  const census = await censusGeocode(query, {
-    timeoutMs: LIST_GEOCODE_TIMEOUT_MS,
-    attempts: LIST_GEOCODE_ATTEMPTS,
-  });
-  if (census) return { ...census, query };
-  const arcgis = await arcgisGeocode(query, bias, {
-    timeoutMs: LIST_GEOCODE_TIMEOUT_MS,
-    attempts: LIST_GEOCODE_ATTEMPTS,
-  });
-  return arcgis ? { ...arcgis, query } : null;
+  const opts = { timeoutMs: LIST_GEOCODE_TIMEOUT_MS, attempts: LIST_GEOCODE_ATTEMPTS };
+  return geocodeListFallback(
+    async () => {
+      const census = await censusGeocode(query, opts);
+      return census ? { ...census, query } : null;
+    },
+    async () => {
+      const arcgis = await arcgisGeocode(query, bias, opts);
+      return arcgis ? { ...arcgis, query } : null;
+    },
+  );
 }
 
 async function photonSuggest(query: string, bias?: LatLng, limit = 6): Promise<Place[]> {
@@ -247,18 +255,20 @@ type ArcgisAddress = {
 };
 
 async function arcgisReverse(coords: LatLng, featureTypes?: string): Promise<Place | null> {
-  const url = reverseGeocodeUrl(coords, featureTypes);
+  const signal = await inboundSignal();
+  const fetchOpts = await prepareReverseLookup(takeSharedGeocodeSlot, signal);
   try {
     const json = await fetchJson<{
       address?: ArcgisAddress;
       location?: { x?: number; y?: number };
-    }>(url);
+    }>(reverseGeocodeUrl(coords, featureTypes), undefined, fetchOpts);
     const label = formatArcgisStreet(json.address);
     const lat = json.location?.y;
     const lng = json.location?.x;
     if (!label || !Number.isFinite(lat) || !Number.isFinite(lng)) return null;
     return { lat: lat as number, lng: lng as number, query: label, label };
-  } catch {
+  } catch (err) {
+    if (isLimitResponseError(err) || isStoppedError(err) || isLookupTimeoutError(err)) throw err;
     return null;
   }
 }
@@ -360,7 +370,7 @@ async function arcgisGeocode(
       label: titleCaseAddress(top.attributes?.Match_addr || top.address || query),
     };
   } catch (err) {
-    if (isLimitResponseError(err)) throw err;
+    if (isLimitResponseError(err) || isStoppedError(err) || isLookupTimeoutError(err)) throw err;
     return null;
   }
 }
@@ -401,7 +411,7 @@ async function censusGeocode(
       label: titleCaseAddress(match.matchedAddress || query),
     };
   } catch (err) {
-    if (isLimitResponseError(err)) throw err;
+    if (isLimitResponseError(err) || isStoppedError(err) || isLookupTimeoutError(err)) throw err;
     return null;
   }
 }

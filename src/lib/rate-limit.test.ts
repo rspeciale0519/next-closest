@@ -216,7 +216,7 @@ describe("shared slot busy vs unavailable", () => {
     assert.equal(now, 0);
   });
 
-  it("throws 429 with Retry-After when the shared slot is only busy", () => {
+  it("throws 429 with Retry-After when the shared slot is only busy", async () => {
     assert.throws(
       () => throwSharedSlotFailure("busy", 3),
       (err: unknown) => err instanceof RateLimitError && err.status === 429 && err.retryAfterSec === 3,
@@ -224,6 +224,7 @@ describe("shared slot busy vs unavailable", () => {
     const response = rateLimitResponse(new RateLimitError("Too many address lookups right now. Try again shortly.", 3));
     assert.equal(response.status, 429);
     assert.equal(response.headers.get("Retry-After"), "3");
+    assert.match(await response.text(), /Retry-After: 3/);
   });
 
   it("throws 503 when Redis is unavailable", () => {

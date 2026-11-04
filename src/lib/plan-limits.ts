@@ -7,7 +7,7 @@
  *
  * Real upstream limits this code respects:
  * - List geocoding is **US Census then ArcGIS only**, one address per HTTP
- *   request. Photon and Nominatim stay on typeahead / reverse, never on lists.
+ *   request. Photon stays on typeahead. Reverse geocoding is ArcGIS only.
  * - Public OSRM table (`router.project-osrm.org`): 100 coordinates / 10,000
  *   cells. A 1,312-stop matrix cannot be requested there.
  * - Vercel serverless time: one `geocodeStops` call must finish inside
