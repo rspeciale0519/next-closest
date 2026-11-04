@@ -14,7 +14,7 @@
  *  - **build**: what the wrapper hands `vite build` / `vite preview`.
  *
  * The built bundle is not read: Vite inlines the flag and the minifier folds
- * `"false" !== "false"` away, so the built client JS carries no marker to
+ * `"true" === "true"` away, so the built client JS carries no marker to
  * compare against unless the app is made to emit one.
  *
  * `scripts/browser-smoke.mjs` runs the comparison on every smoke; run it
@@ -23,14 +23,12 @@
  * `compareAuthInvariant()` rather than re-deriving it.
  */
 import { APP_ENV_ROUTE } from "./app-env-plugin.mjs";
+import { authEnabledFromEnvValue } from "./auth-enabled.mjs";
 import { isMainModule, mergeAppEnv, projectRoot, readAppEnv } from "./with-app-env.mjs";
 
-const DEFAULT_DEV_URL = "http://127.0.0.1:8080";
+export { authEnabledFromEnvValue };
 
-/** The predicate `src/lib/auth/{client,server}.ts` apply to the flag. */
-export function authEnabledFromEnvValue(value) {
-  return value !== "false";
-}
+const DEFAULT_DEV_URL = "http://127.0.0.1:8080";
 
 /**
  * Compare the two resolved values. `null` means "could not observe" — reported

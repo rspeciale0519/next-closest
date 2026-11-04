@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
+import { authEnabledFromEnvValue } from "./auth-enabled.mjs";
 import {
   APP_ENV_REL_PATH,
   mergeAppEnv,
@@ -45,6 +46,10 @@ test("a missing app-env.json is a clean no-op", () => {
   assert.deepEqual(readAppEnv(makeWorkspace()), {});
 });
 
+test("a missing app-env.json ships auth off", () => {
+  assert.equal(authEnabledFromEnvValue(readAppEnv(makeWorkspace()).VITE_AUTH_ENABLED), false);
+});
+
 test("reads the app env from a workspace", () => {
   const root = makeWorkspace('{"VITE_AUTH_ENABLED":"false"}');
   assert.deepEqual(readAppEnv(root), { VITE_AUTH_ENABLED: "false" });
@@ -60,7 +65,10 @@ test("an explicit process-env override wins over the file", () => {
 });
 
 test("the template ships auth off", () => {
-  assert.deepEqual(readAppEnv(projectRoot()), { VITE_AUTH_ENABLED: "false" });
+  // A fresh clone has no .grok/app-env.json. Unset or "false" must both mean off.
+  const fileEnv = readAppEnv(projectRoot());
+  const merged = mergeAppEnv(fileEnv, {});
+  assert.equal(authEnabledFromEnvValue(merged.VITE_AUTH_ENABLED), false);
 });
 
 test("vite loadEnv resolves the wrapped value", () => {
@@ -73,6 +81,10 @@ test("vite loadEnv resolves the wrapped value", () => {
   assert.equal(merged.VITE_AUTH_ENABLED, "false");
 });
 
+function printedAuthFlag(stdout) {
+  return stdout === "undefined" || stdout === "" ? undefined : stdout;
+}
+
 test("the wrapped command runs with the app env applied", async () => {
   const { stdout } = await execFileAsync(process.execPath, [
     WRAPPER,
@@ -80,7 +92,7 @@ test("the wrapped command runs with the app env applied", async () => {
     "-e",
     PRINT_FLAG,
   ]);
-  assert.equal(stdout, "false");
+  assert.equal(authEnabledFromEnvValue(printedAuthFlag(stdout)), false);
 });
 
 test("the wrapped command sees an explicit override, not the file value", async () => {
@@ -124,5 +136,5 @@ test("the CLI still runs when invoked through a symlinked path", async () => {
     "-e",
     PRINT_FLAG,
   ]);
-  assert.equal(stdout, "false");
+  assert.equal(authEnabledFromEnvValue(printedAuthFlag(stdout)), false);
 });

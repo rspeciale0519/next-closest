@@ -32,7 +32,7 @@ const VITE_PREFIX = "VITE_";
 /**
  * Parse an app-env document, keeping only `VITE_`-prefixed string entries.
  * Anything unparseable is an empty environment — a workspace without the file
- * must behave exactly like today (auth on, no overrides).
+ * must leave the flag unset (auth off, no overrides).
  */
 export function parseAppEnv(text) {
   let parsed;
